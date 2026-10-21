@@ -1170,6 +1170,32 @@ fn read_last_applied() -> Option<(String, String)> {
 }
 
 fn main() {
+    // --version / --help answer without touching the Wayland display, so a package
+    // smoke test (`we-native --version`) works in a headless shell.
+    if let Some(first) = std::env::args().nth(1) {
+        match first.as_str() {
+            "--version" | "-V" => {
+                println!("we-native {}", env!("CARGO_PKG_VERSION"));
+                process::exit(0);
+            }
+            "--help" | "-h" => {
+                println!(
+                    "we-native {} — Wayland layer-shell wallpaper kernel\n\n\
+                     Usage:\n  \
+                     we-native --serve <socket>          run as a service, accept control-plane commands\n  \
+                     we-native --scene <dir>             play one scene wallpaper\n  \
+                     we-native --image <file> [--seconds N]\n  \
+                     we-native --video <file> [--video-max WxH]\n  \
+                     we-native --list-outputs            list outputs and exit\n  \
+                     we-native --globals                 list compositor globals and exit\n",
+                    env!("CARGO_PKG_VERSION")
+                );
+                process::exit(0);
+            }
+            _ => {}
+        }
+    }
+
     display_guard::install_panic_hook();
     let args: Vec<String> = std::env::args().collect();
     let list_only = args.iter().any(|a| a == "--list-outputs");

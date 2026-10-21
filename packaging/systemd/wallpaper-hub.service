@@ -1,0 +1,18 @@
+[Unit]
+Description=Wallpaper Hub (COSMIC front-end for the native Wallpaper Engine kernel)
+Documentation=https://github.com/Sunrise-Valley/WallpaperEngines-linuxWayland
+# The UI is optional: it browses/applies wallpapers over the kernel's control plane.
+# It is a user unit started with the graphical session; the kernel unit is pulled in.
+PartOf=graphical-session.target
+After=graphical-session.target wallpaper-native-kernel.service
+Wants=wallpaper-native-kernel.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/wallpaper-hub
+Restart=on-failure
+RestartSec=3
+Slice=session.slice
+
+[Install]
+WantedBy=graphical-session.target

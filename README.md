@@ -129,7 +129,7 @@ UI: polls status on a timer, pushes user property edits the same way
 | `crates/we-native/` | The kernel: Wayland connection, one layer surface per output, control-plane socket, video decode host, audio sinks, sleep/occlusion logic, watchdog, display and commit guards, app-state restore. |
 | `crates/wallpaper-hub/` | The COSMIC app: library scanning, workshop metadata browser, detail panel with user properties, settings, per-scene performance table. |
 | `scripts/` | Standalone tools: `we-ctl` (control-plane client), `raw2png.py`, `png_crop.py`, `img_region_diff.py`, `sharpness.py`, `checker_png.py`, `row_displacement.py`, `scene_health.py`, sysroot helpers. |
-| `packaging/` | systemd user unit for the kernel. |
+| `packaging/` | systemd user units and `build-deb.sh` (the `.deb` builder). |
 | `docs/` | `BUILDING.md` (how to build and run). `ARCHITECTURE.md` lives at the repo root. |
 
 `ARCHITECTURE.md` goes into the renderer's pass model, the mask/RT graph, the control
@@ -164,6 +164,61 @@ scripts/we-ctl apply-scene ~/.local/share/Steam/steamapps/workshop/content/43196
 
 # or use the GUI, which speaks the same socket
 crates/wallpaper-hub/target/release/wallpaper-hub
+```
+
+## Install (Debian/Ubuntu)
+
+A prebuilt `amd64` package is built from this tree; you do not need a Rust toolchain to
+install it.
+
+```sh
+# 1. get the package (release asset, or build it yourself: see below)
+sudo apt install ./wallpaper-hub_0.1.0_amd64.deb
+
+# 2. start it for the current user; the units are user units, no root involved
+systemctl --user daemon-reload
+systemctl --user enable --now wallpaper-hub.service
+```
+
+`apt install ./file.deb` (rather than `dpkg -i`) is deliberate: apt resolves the
+`Depends` computed from the binaries with `dpkg-shlibdeps` and pulls the Wayland, EGL and
+font libraries in one step. `dpkg -i` works too, but leaves you to `apt-get -f install`.
+
+The binaries are dynamically linked against the glibc of the machine that built the
+package, so `Depends` pins it (`libc6 (>= 2.43)` for a Debian 14/forky build). On an
+older release — Debian 13, Ubuntu 24.04 — apt refuses the package; run
+`./packaging/build-deb.sh` there (or in a container of that release) to get a build whose
+`Depends` matches. Nothing else about the package changes.
+
+What lands where:
+
+| Path | Contents |
+|---|---|
+| `/usr/bin/we-native` | the layer-shell kernel |
+| `/usr/bin/wallpaper-hub` | the COSMIC front-end |
+| `/usr/lib/systemd/user/wallpaper-native-kernel.service` | kernel unit (`--serve %t/we-native.sock`) |
+| `/usr/lib/systemd/user/wallpaper-hub.service` | UI unit, pulls in the kernel unit |
+| `/usr/share/applications/io.github.wallpaperhub.WallpaperHub.desktop` | launcher entry |
+| `/usr/share/icons/hicolor/scalable/apps/io.github.wallpaperhub.WallpaperHub.svg` | icon |
+| `/usr/share/doc/wallpaper-hub/` | `README.md`, `ARCHITECTURE.md`, `copyright` |
+
+Both units are `WantedBy=graphical-session.target`, so enabling them once is enough —
+they reconnect on every login. `wallpaper-hub.service` starts the kernel too; you can
+enable just the kernel (`systemctl --user enable --now wallpaper-native-kernel.service`)
+if you prefer to open the UI by hand.
+
+Rebuild the package from source (no sudo, no `/tmp`, output in `dist/`):
+
+```sh
+./packaging/build-deb.sh             # build both binaries, then dpkg-deb
+./packaging/build-deb.sh --no-build  # reuse crates/*/target/release
+```
+
+Uninstall:
+
+```sh
+systemctl --user disable --now wallpaper-hub.service
+sudo apt remove wallpaper-hub
 ```
 
 ## Status and limitations

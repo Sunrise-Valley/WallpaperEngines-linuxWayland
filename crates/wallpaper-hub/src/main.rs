@@ -9,6 +9,28 @@ mod we_ui;
 mod wp;
 
 fn main() -> cosmic::iced::Result {
+    // --version / --help answer without starting the UI, so a package smoke test
+    // (`wallpaper-hub --version`) works in a headless shell with no display.
+    if let Some(first) = std::env::args().nth(1) {
+        match first.as_str() {
+            "--version" | "-V" => {
+                println!("wallpaper-hub {}", env!("CARGO_PKG_VERSION"));
+                std::process::exit(0);
+            }
+            "--help" | "-h" => {
+                println!(
+                    "wallpaper-hub {} — COSMIC front-end for the native Wallpaper Engine kernel\n\n\
+                     Usage: wallpaper-hub [--page <name>] [--apply-first] [--win-w N] [--win-h N]\n\n\
+                     The UI talks to the running kernel over $XDG_RUNTIME_DIR/we-native.sock;\n\
+                     start it with: systemctl --user enable --now wallpaper-native-kernel.service",
+                    env!("CARGO_PKG_VERSION")
+                );
+                std::process::exit(0);
+            }
+            _ => {}
+        }
+    }
+
     // Get the system's preferred languages.
     let requested_languages = i18n_embed::DesktopLanguageRequester::requested_languages();
 

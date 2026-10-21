@@ -37,3 +37,4 @@ __pycache__/
 # local env
 .env
 *.local
+dist/

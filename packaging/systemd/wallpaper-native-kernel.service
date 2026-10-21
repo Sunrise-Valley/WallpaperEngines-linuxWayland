@@ -1,0 +1,24 @@
+[Unit]
+Description=Wallpaper Hub native wallpaper kernel (layer-shell)
+Documentation=https://github.com/Sunrise-Valley/WallpaperEngines-linuxWayland
+# The kernel needs the Wayland session, so it is a *user* unit that starts with
+# graphical-session.target. Installed to /usr/lib/systemd/user/.
+PartOf=graphical-session.target
+After=graphical-session.target
+StartLimitIntervalSec=30
+StartLimitBurst=5
+
+[Service]
+Type=simple
+# %t is the runtime dir ($XDG_RUNTIME_DIR); the socket is how the UI finds the kernel.
+ExecStart=/usr/bin/we-native --serve %t/we-native.sock
+Restart=on-failure
+RestartSec=2
+# A wedged renderer must not take the session with it: the kernel's watchdog exits
+# non-zero and systemd restarts it.
+KillMode=mixed
+TimeoutStopSec=5
+Slice=session.slice
+
+[Install]
+WantedBy=graphical-session.target
