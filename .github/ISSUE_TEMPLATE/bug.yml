@@ -1,0 +1,36 @@
+name: Bug report
+description: Something renders wrong, crashes, or behaves unexpectedly
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. **Do not paste Steam credentials, tokens or cookies.**
+  - type: input
+    id: scene
+    attributes:
+      label: Workshop ID / scene path
+      description: The numeric workshop ID, or the path to the scene folder
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happens
+      description: What you see, and what you expected instead
+    validations:
+      required: true
+  - type: textarea
+    id: env
+    attributes:
+      label: Environment
+      description: Output of `we-native --version`, GPU + driver, compositor, resolution
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Relevant lines from `journalctl --user -u wallpaper-native-kernel`
+      render: text

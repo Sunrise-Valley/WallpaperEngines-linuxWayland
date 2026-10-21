@@ -1,0 +1,22 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: System deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libegl1-mesa-dev libgl1-mesa-dev libwayland-dev \
+            libxkbcommon-dev libpulse-dev libavcodec-dev libavformat-dev libavutil-dev
+      - name: cargo check
+        run: |
+          for c in crates/*/; do
+            [ -f "$c/Cargo.toml" ] && (cd "$c" && cargo check --all-targets) || true
+          done

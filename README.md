@@ -168,20 +168,14 @@ crates/wallpaper-hub/target/release/wallpaper-hub
 
 ## Status and limitations
 
-* **Tested on 17 scenes.** That is the whole corpus this renderer has been validated
-  against. Simple scenes (image layers, additive effects, particles, text) work well;
-  very large scenes with deep effect chains are where the remaining bugs live.
-* **Some effect and mask semantics are still being aligned** with the original engine —
-  mostly the exact space a mask or a blend pass samples in, and the time base of a few
-  particle modes. Where the engine had to guess, the code says so and the constant is
-  named.
-* **Performance depends on the GPU.** The renderer is a straightforward GLES 3 path
-  (no compute, no bindless); a full-screen scene with a dozen effect passes at 2560×1440
-  is heavy. The adaptive frame-rate logic exists precisely because of that.
-* **Wayland only** (COSMIC is the tested compositor). The layer-shell and fractional
-  scaling paths assume wlroots-compatible behaviour; X11 is not implemented.
-* **No Steam integration.** The UI reads the local workshop directory; it does not log
-  in, subscribe, download or modify anything in your Steam library.
+* **Tested on a limited sample of scenes.** The renderer has not been validated against
+  the whole workshop, so we cannot guarantee that every wallpaper reproduces exactly.
+  If a scene looks wrong, please open an issue with the workshop ID.
+* **Rendering cost grows with the scene.** A full-screen scene with many effect passes is
+  GPU-heavy; the adaptive frame-rate logic exists for that reason.
+* **Wayland only** (COSMIC is the tested compositor); X11 is not implemented.
+* **No Steam integration.** The UI reads the local workshop directory; it never logs in,
+  subscribes, downloads, or modifies your Steam library.
 
 ## Environment variables
 
