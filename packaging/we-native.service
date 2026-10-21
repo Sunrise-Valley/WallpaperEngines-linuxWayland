@@ -1,0 +1,26 @@
+[Unit]
+Description=Wallpaper Hub native wallpaper kernel (layer-shell)
+Documentation=https://github.com/your-org/wallpaper-hub
+# The kernel needs the Wayland session; it is started as a user unit, after the
+# graphical session is up.
+PartOf=graphical-session.target
+After=graphical-session.target
+# If the compositor dies our connection dies with it; restarting is correct.
+StartLimitIntervalSec=30
+StartLimitBurst=5
+
+[Service]
+Type=simple
+# Adjust the binary path to your install location, or use an absolute path:
+#   ExecStart=%h/.local/bin/we-native --serve %t/we-native.sock
+ExecStart=%h/.local/bin/we-native --serve %t/we-native.sock
+Restart=on-failure
+RestartSec=2
+# A wedged renderer must not be able to take the session with it. The kernel's own
+# watchdog exits with a non-zero code for that case; systemd restarts it.
+KillMode=mixed
+TimeoutStopSec=5
+Slice=session.slice
+
+[Install]
+WantedBy=graphical-session.target

@@ -1,0 +1,2123 @@
+syntax = "proto3";
+
+package waywallen.control.v1;
+
+import "filter.proto";
+
+// ---------------------------------------------------------------------------
+// Envelope
+// ---------------------------------------------------------------------------
+//
+// Wire direction is asymmetric:
+//   * client → server : a bare `Request` on every frame.
+//   * server → client : a `ServerFrame` wrapping either the matching
+//     `Response` (request_id echoes the client's Request) or a
+//     server-initiated `Event` (no request_id).
+//
+// Splitting Event out of `Response` keeps request_id semantics clean
+// and lets the server push display state changes without a poll.
+
+message ServerFrame {
+  oneof kind {
+    Response response = 1;
+    Event    event    = 2;
+  }
+}
+
+message Request {
+  reserved 55, 56, 67, 68;
+
+  uint64 request_id = 1;
+  oneof payload {
+    HealthRequest             health = 10;
+    RendererSpawnRequest      renderer_spawn = 11;
+    RendererListRequest       renderer_list = 12;
+    RendererPlayRequest       renderer_play = 13;
+    RendererPauseRequest      renderer_pause = 14;
+    RendererMouseRequest      renderer_mouse = 15;
+    RendererFpsRequest        renderer_fps = 16;
+    RendererKillRequest       renderer_kill = 17;
+    RendererPluginListRequest renderer_plugin_list = 18;
+    WallpaperListRequest      wallpaper_list = 19;
+    WallpaperScanRequest      wallpaper_scan = 20;
+    SourceListRequest         source_list = 21;
+    WallpaperApplyRequest     wallpaper_apply = 22;
+    DisplayListRequest        display_list = 23;
+    SettingsGetRequest        settings_get = 24;
+    SettingsSetRequest        settings_set = 25;
+    LibraryListRequest        library_list = 26;
+    LibraryAddRequest         library_add = 27;
+    LibraryRemoveRequest      library_remove = 28;
+    LibraryAutoDetectRequest  library_auto_detect = 29;
+    PlaylistListRequest       playlist_list = 30;
+    PlaylistCreateRequest     playlist_create = 31;
+    PlaylistDeleteRequest     playlist_delete = 32;
+    PlaylistRenameRequest     playlist_rename = 33;
+    PlaylistSetItemsRequest   playlist_set_items = 34;
+    PlaylistSetModeRequest    playlist_set_mode = 35;
+    PlaylistSetIntervalRequest playlist_set_interval = 36;
+    PlaylistActivateRequest   playlist_activate = 37;
+    PlaylistDeactivateRequest playlist_deactivate = 38;
+    PlaylistStatusRequest     playlist_status = 39;
+    DisplayLayoutSetRequest   display_layout_set = 40;
+    GpuListRequest            gpu_list = 41;
+    WallpaperGetRequest       wallpaper_get = 42;
+    WallpaperPropertySetRequest wallpaper_property_set = 43;
+    WallpaperApplyViaPortalRequest wallpaper_apply_via_portal = 44;
+    DisplayRenameRequest      display_rename = 45;
+    PluginInstallRequest      plugin_install = 46;
+    PluginListRequest         plugin_list = 47;
+    TagListRequest            tag_list = 48;
+    ContentRatingListRequest  content_rating_list = 49;
+    RemoteAvailabilityRequest remote_availability = 50;
+    RemoteSearchRequest       remote_search = 51;
+    RemoteDownloadRequest     remote_download = 52;
+    RemoteUninstallRequest    remote_uninstall = 53;
+    RemoteDetailsRequest      remote_details = 54;
+    PlaylistJumpToRequest     playlist_jump_to = 58;
+    WallpaperLayoutSetRequest wallpaper_layout_set = 59;
+    PluginDeleteRequest       plugin_delete = 60;
+    WallpaperRemoveRequest    wallpaper_remove = 61;
+    PluginInspectRequest      plugin_inspect = 62;
+    PluginUpdateCheckRequest  plugin_update_check = 63;
+    PluginUpdateInstallRequest plugin_update_install = 64;
+    AutostartGetRequest       autostart_get = 65;
+    AutostartSetRequest       autostart_set = 66;
+    PluginActionRequest       plugin_action = 69;
+    SubscriptionStatusRequest subscription_status = 70;
+    SubscriptionSetRequest    subscription_set = 71;
+    QrLoginCancelRequest      qr_login_cancel = 72;
+    RemoteSettingsPatchRequest remote_settings_patch = 73;
+    WallpaperUnsubscribeRequest wallpaper_unsubscribe = 74;
+    GlobalPauseToggleRequest    global_pause_toggle = 75;
+    GlobalPauseSetRequest       global_pause_set = 76;
+    GlobalMuteSetRequest        global_mute_set = 77;
+    GlobalStopSetRequest        global_stop_set = 78;
+    CanvasListRequest           canvas_list = 79;
+    CanvasCreateRequest         canvas_create = 80;
+    CanvasUpdateRequest         canvas_update = 81;
+    CanvasDeleteRequest         canvas_delete = 82;
+    CanvasLayoutSetRequest      canvas_layout_set = 83;
+    CanvasMemberConfigureRequest canvas_member_configure = 84;
+    PluginTranslationListRequest     plugin_translation_list = 85;
+    PlaylistGetRequest          playlist_get = 86;
+    PlaylistUpdateRequest       playlist_update = 87;
+    LogReadRequest              log_read = 88;
+    WallpaperLookupRequest      wallpaper_lookup = 89;
+    DisplayPauseSetRequest      display_pause_set = 90;
+    WallpaperHideRequest        wallpaper_hide = 91;
+  }
+}
+
+message Response {
+  reserved 55, 56, 67, 68;
+
+  uint64 request_id = 1;
+  // Coarse status class, kept for back-compat with clients that haven't
+  // adopted `error_code` yet. Derived from `error_code` server-side.
+  Status status = 2;
+  string message = 3;
+  // Typed error pin-pointing the failure. `ERROR_CODE_OK` (0) on success;
+  // every non-OK value carries one specific failure category. New clients
+  // should branch on this and treat `status`/`message` as legacy fields.
+  ErrorCode error_code = 4;
+  oneof payload {
+    HealthResponse             health = 10;
+    RendererSpawnResponse      renderer_spawn = 11;
+    RendererListResponse       renderer_list = 12;
+    Empty                      renderer_play = 13;
+    Empty                      renderer_pause = 14;
+    Empty                      renderer_mouse = 15;
+    Empty                      renderer_fps = 16;
+    Empty                      renderer_kill = 17;
+    RendererPluginListResponse renderer_plugin_list = 18;
+    WallpaperListResponse      wallpaper_list = 19;
+    WallpaperScanResponse      wallpaper_scan = 20;
+    SourceListResponse         source_list = 21;
+    WallpaperApplyResponse     wallpaper_apply = 22;
+    DisplayListResponse        display_list = 23;
+    SettingsGetResponse        settings_get = 24;
+    Empty                      settings_set = 25;
+    LibraryListResponse        library_list = 26;
+    Empty                      library_add = 27;
+    Empty                      library_remove = 28;
+    LibraryAutoDetectResponse  library_auto_detect = 29;
+    PlaylistListResponse       playlist_list = 30;
+    PlaylistCreateResponse     playlist_create = 31;
+    Empty                      playlist_delete = 32;
+    Empty                      playlist_rename = 33;
+    Empty                      playlist_set_items = 34;
+    Empty                      playlist_set_mode = 35;
+    Empty                      playlist_set_interval = 36;
+    Empty                      playlist_activate = 37;
+    Empty                      playlist_deactivate = 38;
+    PlaylistStatusResponse     playlist_status = 39;
+    DisplayLayoutSetResponse   display_layout_set = 40;
+    GpuListResponse            gpu_list = 41;
+    WallpaperGetResponse       wallpaper_get = 42;
+    WallpaperPropertySetResponse wallpaper_property_set = 43;
+    WallpaperApplyViaPortalResponse wallpaper_apply_via_portal = 44;
+    DisplayRenameResponse      display_rename = 45;
+    PluginInstallResponse      plugin_install = 46;
+    PluginListResponse         plugin_list = 47;
+    TagListResponse            tag_list = 48;
+    ContentRatingListResponse  content_rating_list = 49;
+    RemoteAvailabilityResponse remote_availability = 50;
+    RemoteSearchResponse       remote_search = 51;
+    RemoteDownloadResponse     remote_download = 52;
+    RemoteUninstallResponse    remote_uninstall = 53;
+    RemoteDetailsResponse      remote_details = 54;
+    Empty                      playlist_jump_to = 58;
+    WallpaperLayoutSetResponse wallpaper_layout_set = 59;
+    PluginDeleteResponse       plugin_delete = 60;
+    WallpaperRemoveResponse    wallpaper_remove = 61;
+    PluginInspectResponse      plugin_inspect = 62;
+    PluginUpdateCheckResponse  plugin_update_check = 63;
+    PluginUpdateInstallResponse plugin_update_install = 64;
+    AutostartGetResponse       autostart_get = 65;
+    AutostartSetResponse       autostart_set = 66;
+    PluginActionResponse       plugin_action = 69;
+    SubscriptionStatusResponse subscription_status = 70;
+    SubscriptionSetResponse    subscription_set = 71;
+    QrLoginCancelResponse      qr_login_cancel = 72;
+    Empty                      remote_settings_patch = 73;
+    WallpaperUnsubscribeResponse wallpaper_unsubscribe = 74;
+    GlobalPauseToggleResponse  global_pause_toggle = 75;
+    GlobalPauseSetResponse     global_pause_set = 76;
+    GlobalMuteSetResponse      global_mute_set = 77;
+    GlobalStopSetResponse      global_stop_set = 78;
+    CanvasListResponse          canvas_list = 79;
+    CanvasCreateResponse        canvas_create = 80;
+    CanvasUpdateResponse        canvas_update = 81;
+    Empty                       canvas_delete = 82;
+    CanvasLayoutSetResponse     canvas_layout_set = 83;
+    CanvasMemberConfigureResponse canvas_member_configure = 84;
+    PluginTranslationListResponse      plugin_translation_list = 85;
+    PlaylistGetResponse          playlist_get = 86;
+    Empty                        playlist_update = 87;
+    LogReadResponse              log_read = 88;
+    WallpaperLookupResponse      wallpaper_lookup = 89;
+    DisplayPauseSetResponse      display_pause_set = 90;
+    WallpaperHideResponse        wallpaper_hide = 91;
+  }
+}
+
+enum Status {
+  STATUS_UNSPECIFIED = 0;
+  OK = 1;
+  INVALID_ARGUMENT = 2;
+  NOT_FOUND = 3;
+  INTERNAL = 4;
+  FAILED_PRECONDITION = 5;
+}
+
+// Typed failure code carried on every `Response`. `ERROR_CODE_OK` (0) means
+// success; every non-OK value pin-points one specific failure category.
+// Numeric ranges are reserved per subsystem so codes can be added without
+// collisions: generic 1–99, renderer 100–199, wallpaper/source 200–299,
+// settings 300–399, library 400–499, playlist 500–599.
+enum ErrorCode {
+  ERROR_CODE_OK = 0;
+
+  // Generic / framing
+  ERROR_CODE_INTERNAL = 1;
+  ERROR_CODE_DECODE = 2;
+  ERROR_CODE_INVALID_ARGUMENT = 3;
+  ERROR_CODE_UNEXPECTED_PAYLOAD = 4;     // empty `Request.payload`
+  ERROR_CODE_FAILED_PRECONDITION = 5;
+  ERROR_CODE_DB = 6;
+
+  // Renderers
+  ERROR_CODE_RENDERER_NOT_FOUND = 100;
+  ERROR_CODE_RENDERER_SPAWN_FAILED = 101;
+  ERROR_CODE_RENDERER_CONTROL_FAILED = 102;
+  ERROR_CODE_NO_RENDERER_FOR_TYPE = 103;
+  ERROR_CODE_RENDERER_TYPE_MISMATCH = 104;
+  ERROR_CODE_RENDERER_FRAME_FAILED = 105;
+
+  // Wallpapers / sources
+  ERROR_CODE_WALLPAPER_NOT_FOUND = 200;
+  ERROR_CODE_NO_DISPLAY_REGISTERED = 201;
+  ERROR_CODE_SOURCE_PLUGIN_NOT_FOUND = 202;
+  ERROR_CODE_SOURCE_APPLY_FAILED = 203;
+  ERROR_CODE_WALLPAPER_TYPE_NOT_SUPPORTED = 204;
+  ERROR_CODE_PORTAL_CALL_FAILED = 205;
+  ERROR_CODE_PLUGIN_INSTALL_FAILED = 206;
+  ERROR_CODE_PLUGIN_DELETE_FAILED = 207;
+  ERROR_CODE_SOURCE_ITEM_REMOVE_UNSUPPORTED = 208;
+  ERROR_CODE_SOURCE_ITEM_REMOVE_FAILED = 209;
+  ERROR_CODE_SOURCE_ITEM_UNSUBSCRIBE_UNSUPPORTED = 210;
+
+  // Settings
+  ERROR_CODE_SETTINGS_VALIDATION_FAILED = 300;
+  ERROR_CODE_SETTINGS_APPLY_FAILED = 301;
+
+  // Libraries
+  ERROR_CODE_LIBRARY_NOT_FOUND = 400;
+
+  // Playlists
+  ERROR_CODE_PLAYLIST_NOT_FOUND = 500;
+  ERROR_CODE_PLAYLIST_INVALID = 501;
+  ERROR_CODE_PLAYLIST_REVISION_CONFLICT = 502;
+
+  // Displays
+  ERROR_CODE_DISPLAY_NOT_FOUND = 600;
+  ERROR_CODE_CANVAS_NOT_FOUND = 601;
+  ERROR_CODE_CANVAS_INVALID = 602;
+  ERROR_CODE_CANVAS_MEMBER_CONFLICT = 603;
+  ERROR_CODE_DISPLAY_BELONGS_TO_CANVAS = 604;
+  ERROR_CODE_CANVAS_HAS_NO_LIVE_DISPLAY = 605;
+  ERROR_CODE_CANVAS_REVISION_CONFLICT = 606;
+}
+
+message Empty {}
+
+message PluginMessage {
+  string plugin_id = 1;
+  string msgid = 2;
+  repeated string arguments = 3;
+}
+
+// ---------------------------------------------------------------------------
+// Health
+// ---------------------------------------------------------------------------
+
+message HealthRequest {}
+message HealthResponse {
+  string service = 1;
+  string state = 2;
+  string os_name = 3;
+}
+
+// ---------------------------------------------------------------------------
+// Renderer lifecycle
+// ---------------------------------------------------------------------------
+
+message RendererSpawnRequest {
+  string wp_type = 1;
+  map<string, string> metadata = 2;
+  uint32 width = 3;
+  uint32 height = 4;
+  uint32 fps = 5;
+}
+message RendererSpawnResponse {
+  string renderer_id = 1;
+}
+
+message RendererListRequest {}
+message RendererListResponse {
+  repeated string renderers = 1;
+  repeated RendererInstance instances = 2;
+}
+
+enum RuntimeConditionKind {
+  RUNTIME_CONDITION_UNSPECIFIED = 0;
+  RUNTIME_CONDITION_LOADING = 1;
+  RUNTIME_CONDITION_WAITING = 2;
+  RUNTIME_CONDITION_HANG = 3;
+}
+
+enum RuntimeConditionOrigin {
+  RUNTIME_CONDITION_ORIGIN_UNSPECIFIED = 0;
+  RUNTIME_CONDITION_ORIGIN_RENDERER = 1;
+  RUNTIME_CONDITION_ORIGIN_DISPLAY = 2;
+  RUNTIME_CONDITION_ORIGIN_RELEASE = 3;
+}
+
+message RuntimeCondition {
+  RuntimeConditionKind kind = 1;
+  RuntimeConditionOrigin origin = 2;
+  string reason = 3;
+  string related_renderer_id = 4;
+  uint64 related_display_id = 5;
+}
+
+message RendererRuntimeTag {
+  string key = 1;
+  string value = 2;
+}
+
+enum RendererActivity {
+  RENDERER_ACTIVITY_UNSPECIFIED = 0;
+  RENDERER_ACTIVITY_PLAYING = 1;
+  RENDERER_ACTIVITY_PAUSED = 2;
+  RENDERER_ACTIVITY_MUTED = 3;
+}
+
+message RendererExit {
+  sint32 code = 1;
+  sint32 signal = 2;
+  bool has_code = 3;
+  bool has_signal = 4;
+  string reason = 5;
+}
+
+message RendererStartingState { uint64 generation = 1; }
+message RendererRunningState {
+  uint64 generation = 1;
+  RendererActivity activity = 2;
+}
+message RendererStoppingState {
+  uint64 generation = 1;
+  bool keep = 2;
+}
+message RendererStoppedState {
+  bool keep = 1;
+  RendererExit last_exit = 2;
+}
+message RendererKilledState {
+  bool keep = 1;
+  RendererExit last_exit = 2;
+}
+message RendererFailedState { RendererExit failure = 1; }
+
+message RendererState {
+  oneof kind {
+    RendererStartingState starting = 1;
+    RendererRunningState running = 2;
+    RendererStoppingState stopping = 3;
+    RendererStoppedState stopped = 4;
+    RendererKilledState killed = 5;
+    RendererFailedState failed = 6;
+  }
+}
+
+message RendererInstance {
+  reserved 3, 12, 13, 14, 15, 16;
+  reserved "status", "process_state", "activity_state", "keep", "process_generation", "last_exit";
+
+  string renderer_id = 1;
+  uint32 fps         = 2;
+  string name        = 4; // renderer plugin name from RendererDef.name
+  uint32 pid         = 5; // OS pid of the renderer child; 0 if unknown
+  // DRM render-node id of the GPU this renderer's Vulkan instance picked,
+  // sourced from its `Ready` event. Both 0 ⇒ unknown (driver lacks
+  // VK_EXT_physical_device_drm). UI cross-references against `GpuList` to
+  // show a human description.
+  uint32 drm_render_major = 6;
+  uint32 drm_render_minor = 7;
+  // Most-recent BindBuffers dims; falls back to the spawn-time
+  // `Init.extent_w/h` hint pre-bind. 0 ⇒ unknown.
+  uint32 texture_width  = 8;
+  uint32 texture_height = 9;
+  repeated RuntimeCondition conditions = 10;
+  repeated RendererRuntimeTag runtime_tags = 11;
+  RendererState state = 17;
+}
+
+message RendererPlayRequest  { string renderer_id = 1; }
+message RendererPauseRequest { string renderer_id = 1; }
+message GlobalPauseToggleRequest {}
+message GlobalPauseToggleResponse { bool paused = 1; }
+message GlobalPauseSetRequest { bool paused = 1; }
+message GlobalPauseSetResponse { bool paused = 1; }
+message GlobalMuteSetRequest { bool muted = 1; }
+message GlobalMuteSetResponse { bool muted = 1; }
+message GlobalStopSetRequest { bool stopped = 1; }
+message GlobalStopSetResponse { bool stopped = 1; }
+
+message RendererMouseRequest {
+  string renderer_id = 1;
+  double x = 2;
+  double y = 3;
+}
+
+message RendererFpsRequest {
+  string renderer_id = 1;
+  uint32 fps = 2;
+}
+
+message RendererKillRequest { string renderer_id = 1; }
+
+// ---------------------------------------------------------------------------
+// Renderer plugin registry
+// ---------------------------------------------------------------------------
+
+message RendererPluginListRequest {}
+message RendererPluginListResponse {
+  repeated RendererPluginInfo renderers = 1;
+  repeated string supported_types = 2;
+  // Display labels for the keys in `supported_types`, looked up by
+  // `WallpaperTypeInfo.type`. Sparse: only types whose renderer manifest
+  // declares a label appear, and a client that finds no entry for a type
+  // shows the key itself, as it did before this field existed.
+  repeated WallpaperTypeInfo type_labels = 3;
+}
+
+// A wallpaper type key paired with the label a UI shows for it. The key
+// stays the filter/spawn value; only the presentation is localized.
+message WallpaperTypeInfo {
+  string type = 1;
+  // English source text as the plugin wrote it, so clients that do not
+  // resolve plugin messages still have something readable.
+  string label = 2;
+  PluginMessage label_text = 3;
+}
+message RendererPluginInfo {
+  string name = 1;
+  string bin = 2;
+  repeated string types = 3;
+  uint32 priority = 4;
+  string version = 5;
+  // Per-setting schema entries derived from the manifest's
+  // `[renderers.<name>.settings.*]` table. UIs use these to render typed
+  // input widgets; daemon enforces validation independently before
+  // accepting a `SettingsSet`.
+  repeated SettingSchema settings = 6;
+  // Domain id of the installable plugin that provides this renderer
+  // component (its `plugin.toml` `[plugin].id`).
+  string plugin_id = 7;
+}
+
+// Wire encoding of one `[renderer.settings.<key>]` row. All
+// numerics/defaults are stringified so the message stays uniform with
+// `PluginSettings.values` (also string→string). Empty `min`/`max`/`step`
+// = unset.
+message SettingSchema {
+  string key = 1;
+  SettingValueType type = 2;
+  string default_value = 3;
+  bool identity = 4;
+  string label_key = 5;
+  string description_key = 6;
+  string min = 7;
+  string max = 8;
+  string step = 9;
+  repeated string choices = 10;
+  string group = 11;
+  int32 order = 12;
+  PluginMessage label = 13;
+  PluginMessage description = 14;
+  PluginMessage group_label = 15;
+}
+
+enum SettingValueType {
+  SETTING_VALUE_TYPE_UNSPECIFIED = 0;
+  SETTING_VALUE_TYPE_U32 = 1;
+  SETTING_VALUE_TYPE_F32 = 2;
+  SETTING_VALUE_TYPE_STRING = 3;
+  SETTING_VALUE_TYPE_BOOL = 4;
+  SETTING_VALUE_TYPE_I32 = 5;
+}
+
+// ---------------------------------------------------------------------------
+// Wallpapers / sources
+// ---------------------------------------------------------------------------
+
+message WallpaperEntry {
+  string id = 1;
+  string name = 2;
+  string wp_type = 3;
+  string resource = 4;
+  string preview = 5;
+  map<string, string> metadata = 6;
+  int64 size = 7;
+  uint32 width = 8;
+  uint32 height = 9;
+  string content_rating = 10;
+  // Tags pulled from the DB at response time. Empty if the entry has
+  // no matching DB row or no tags. WallpaperList batch-loads this; the
+  // single-item WallpaperGet returns the freshest view.
+  repeated string tags = 11;
+  // JSON dump of the renderer-published user-property schema
+  // (project.json `general.properties` merged with runtime overrides).
+  // Empty when no renderer is currently running this wallpaper.
+  string user_properties_schema = 12;
+  // Per-item edits the user has made to the schema's default values.
+  // Persisted in the DB as a JSON object (`{"key":"value", …}`) and
+  // shipped to the renderer verbatim through `Init.user_properties`;
+  // surfaced here verbatim too so the UI can `JSON.parse` once and
+  // avoid relying on Qt's QHash<QString,QString> bridge into QML.
+  // Empty string when the user hasn't edited anything.
+  string user_property_overrides = 13;
+  // Source-provided free-form description (e.g. Wallpaper Engine
+  // `project.description`). Empty when the source didn't set one.
+  string description = 14;
+  // Stable identifier assigned by the source plugin.
+  // Empty when the source didn't set one.
+  string external_id = 15;
+  // Per-wallpaper display layout override. When set, this whole layout
+  // wins over the display's own layout while the wallpaper is active.
+  LayoutPrefs wallpaper_layout_override = 16;
+  bool wallpaper_layout_override_set = 17;
+  // True when the source plugin can remove this item from its backing
+  // storage. The daemon still owns the DB row deletion after plugin success.
+  bool supports_item_remove = 18;
+  // True when this scanned item maps to a subscription owned by its source.
+  // Subscription state is not queried; clients initially treat it as subscribed.
+  bool supports_item_unsubscribe = 19;
+  // Source-provided page for this wallpaper on its remote service.
+  // Empty for local wallpapers and sources that do not provide one.
+  string web_url = 20;
+  // When true, the library browser hides this item unless the
+  // WallpaperListRequest hidden_filter includes it.
+  bool hidden = 21;
+}
+
+message WallpaperListRequest {
+  string wp_type = 1; // empty = all
+  // Page-based pagination. page is 0-indexed; page_size = 0 means "no
+  // pagination, return all entries matching wp_type".
+  uint32 page = 2;
+  uint32 page_size = 3;
+  reserved 4;
+  repeated WallpaperFilterRule filters = 5;
+  repeated FilterLogic filter_logics = 6;
+  repeated WallpaperSortRule sorts = 7;
+  // Free-text search across wallpaper text, tags, and external_id. The
+  // daemon ANDs it with the existing filter expression.
+  string search_text = 8;
+  // Wallpaper types to exclude outright (quick type toggles in the UI,
+  // independent of the structured filter rules). An entry whose
+  // `wp_type` is listed here is dropped before the rule filter runs.
+  repeated string skip_types = 9;
+  // Quick tag filter (independent of the structured rules): keep only
+  // wallpapers having any of these tags. Empty = no constraint (all).
+  repeated string filter_tags = 10;
+  // Content ratings to exclude (quick toggles, like skip_types). An
+  // entry whose `content_rating` is listed here is dropped.
+  repeated string skip_content_ratings = 11;
+  // How to treat wallpapers marked hidden. Default EXCLUDE.
+  WallpaperHiddenFilter hidden_filter = 12;
+}
+
+// Library-browser filter for the per-item `hidden` flag.
+enum WallpaperHiddenFilter {
+  // Show every wallpaper except those marked hidden.
+  WALLPAPER_HIDDEN_FILTER_EXCLUDE = 0;
+  // Show only wallpapers marked hidden.
+  WALLPAPER_HIDDEN_FILTER_ONLY = 1;
+  // Show all wallpapers, including hidden ones.
+  WALLPAPER_HIDDEN_FILTER_INCLUDE = 2;
+}
+message WallpaperListResponse {
+  repeated WallpaperEntry wallpapers = 1;
+  // Total number of entries matching wp_type, ignoring offset/limit. Allows the
+  // client to know when it has fetched the last page.
+  uint32 count = 2;
+}
+
+// Lightweight ordered lookup for views that already know the wallpaper ids.
+// It never invokes source plugins or remote services.
+message WallpaperLookupRequest {
+  repeated string wallpaper_ids = 1;
+}
+message WallpaperLookupResponse {
+  repeated WallpaperEntry wallpapers = 1;
+}
+
+// Fetch the freshest view of a single wallpaper (snapshot entry +
+// DB media-meta + tags). Used by the UI's detail panel so it can
+// show data that may have been written after the initial list page.
+message WallpaperGetRequest {
+  string wallpaper_id = 1;
+}
+message WallpaperGetResponse {
+  WallpaperEntry entry = 1;
+}
+
+// Commit or reset one user-property override for a wallpaper. The daemon
+// persists the operation and pushes the effective value to a live renderer.
+message WallpaperPropertySetRequest {
+  string wallpaper_id = 1;
+  string key = 2;
+  oneof operation {
+    // Empty text is a valid override value.
+    string value = 3;
+    // Presence requests reset; the boolean value is ignored.
+    bool reset = 4;
+  }
+}
+message WallpaperPropertySetResponse {}
+
+// Commit or clear the per-wallpaper display layout override. Unlike
+// `WallpaperPropertySetRequest`, this is daemon-owned data and is
+// persisted outside renderer user-property overrides.
+message WallpaperLayoutSetRequest {
+  string wallpaper_id = 1;
+  bool clear = 2;
+  LayoutPrefs layout = 3;
+}
+message WallpaperLayoutSetResponse {
+  WallpaperEntry entry = 1;
+}
+
+message WallpaperRemoveRequest {
+  string wallpaper_id = 1;
+  repeated string wallpaper_ids = 2;
+}
+message WallpaperRemoveResponse {
+  uint32 removed_count = 1;
+}
+
+message WallpaperUnsubscribeRequest {
+  string wallpaper_id = 1;
+}
+message WallpaperUnsubscribeResponse {}
+
+message WallpaperHideRequest {
+  string wallpaper_id = 1;
+  repeated string wallpaper_ids = 2;
+  bool hidden = 3;
+}
+message WallpaperHideResponse {
+  // Number of items whose hidden flag actually changed.
+  uint32 updated_count = 1;
+}
+
+message WallpaperHiddenChanged {
+  repeated string wallpaper_ids = 1;
+  bool hidden = 2;
+}
+
+message WallpaperScanRequest {}
+// Ack-only — the rescan now runs asynchronously on the daemon. `count`
+// is `0` for newly-queued scans; the actual entry count arrives in the
+// later `WallpaperSyncFinished` server event so the UI does not have
+// to block on the response.
+message WallpaperScanResponse {
+  uint32 count = 1;
+}
+
+message SourceListRequest {}
+message SourceListResponse {
+  repeated SourcePluginInfo sources = 1;
+}
+message SourcePluginInfo {
+  string name = 1;
+  repeated string types = 2;
+  string version = 3;
+  // Short label a UI shows as the placeholder when prompting for a
+  // library path (e.g. "Media Library Path"). Empty = UI falls back
+  // to a generic label.
+  string library_label = 4;
+  // Longer helper text describing what kind of path to choose. May
+  // contain newlines. Empty = no hint shown.
+  string library_hint = 5;
+  // Domain id of the owning installable plugin (e.g.
+  // org.waywallen.open-wallpaper-engine). Settings use the source `name`.
+  string plugin_id = 6;
+  // User-configurable settings the plugin declares via `info().settings`,
+  // rendered by the generic plugin-settings page.
+  repeated SettingSchema settings = 7;
+  PluginMessage library_label_text = 8;
+  PluginMessage library_hint_text = 9;
+}
+
+message WallpaperApplyRequest {
+  string wallpaper_id = 1;
+  // Empty means every Canvas once plus every independent live display.
+  repeated PresentationTarget targets = 5;
+  // Optional renderer plugin name. Empty (default) lets the daemon pick
+  // the highest-priority renderer registered for the wallpaper's type.
+  // Non-empty selects that exact renderer; the daemon validates that it
+  // is registered AND advertises this wallpaper's type.
+  string renderer_name = 6;
+}
+message PresentationTarget {
+  oneof target {
+    uint64 display_id = 1;
+    string canvas_id = 2;
+  }
+}
+message WallpaperApplyResponse {
+  string renderer_id = 1;
+  string wallpaper_id = 2;
+  string wp_type = 3;
+  string name = 4;
+  bool deferred = 5;
+  repeated WallpaperApplyStoppedPlaylist stopped_playlists = 6;
+  repeated PresentationTarget targets = 7;
+  repeated uint64 display_ids = 8;
+}
+message WallpaperApplyStoppedPlaylist {
+  int64 playlist_id = 1;
+  string playlist_name = 2;
+  repeated uint64 display_ids = 3;
+  bool all_displays = 4;
+}
+
+// Apply a wallpaper via the org.freedesktop.portal.Wallpaper portal —
+// an independent code path that does not touch the renderer / router /
+// display surface. Image-only by design; the DE's portal backend owns
+// the actual rendering. Intended as a fallback for environments where
+// the daemon has no display (e.g. plain X11 desktops, or before a
+// `waywallen-display` consumer has connected). Single-flight under the
+// `apply/portal` key.
+message WallpaperApplyViaPortalRequest {
+  string wallpaper_id = 1;
+}
+message WallpaperApplyViaPortalResponse {
+  string wallpaper_id = 1;
+  string uri = 2;
+}
+
+// ---------------------------------------------------------------------------
+// Displays
+// ---------------------------------------------------------------------------
+
+message DisplayLinkInfo {
+  string renderer_id = 1;
+  int32  z_order     = 2;
+  bool active = 3;
+}
+
+// Wallpaper fit policy. Values mirror Plasma's wallpaper plugin enum
+// (Stretched / PreserveAspectFit / PreserveAspectCrop / Tiled /
+// TiledOnlyHorizontally / TiledOnlyVertically / Centered) so the daemon
+// API maps 1:1 onto a future Plasma plugin. Tile* variants used to
+// exist (tags 4, 5, 6) but were never wired through — the v1
+// CompositionConfig can't express texture wrap in a single rect, and
+// the daemon was just degrading them to PRESERVE_ASPECT_FIT.
+enum FillMode {
+  FILL_MODE_UNSPECIFIED          = 0;
+  FILL_MODE_STRETCHED            = 1;
+  FILL_MODE_PRESERVE_ASPECT_FIT  = 2;
+  FILL_MODE_PRESERVE_ASPECT_CROP = 3;
+  FILL_MODE_CENTERED              = 7;
+  reserved 4, 5, 6;
+  reserved "FILL_MODE_TILED", "FILL_MODE_TILED_ONLY_HORIZONTAL",
+           "FILL_MODE_TILED_ONLY_VERTICAL";
+}
+
+// Buffer-side rotation applied per display. Mirrors a subset of
+// wl_output.transform (0..3 — no flips). The compositor compensates
+// for the declared pre-rotation, so visually the wallpaper appears
+// rotated CW by the chosen angle.
+enum Rotation {
+  ROTATION_UNSPECIFIED = 0;
+  ROTATION_NORMAL      = 1;
+  ROTATION_CW_90       = 2;
+  ROTATION_CW_180      = 3;
+  ROTATION_CW_270      = 4;
+}
+
+// Mirrors the displayed wallpaper after rotation.
+enum Flip {
+  FLIP_UNSPECIFIED = 0;
+  FLIP_NONE = 1;
+  FLIP_HORIZONTAL = 2;
+  FLIP_VERTICAL = 3;
+  FLIP_BOTH = 4;
+}
+
+// 9-position alignment grid. Kept for older clients; new clients
+// should use location_x/location_y below for 0..100 positioning.
+enum Align {
+  ALIGN_UNSPECIFIED   = 0;
+  ALIGN_TOP_LEFT      = 1;
+  ALIGN_TOP           = 2;
+  ALIGN_TOP_RIGHT     = 3;
+  ALIGN_LEFT          = 4;
+  ALIGN_CENTER        = 5;
+  ALIGN_RIGHT         = 6;
+  ALIGN_BOTTOM_LEFT   = 7;
+  ALIGN_BOTTOM        = 8;
+  ALIGN_BOTTOM_RIGHT  = 9;
+}
+
+// Resolved (or default) layout values. Used both for the global
+// default in `GlobalSettings.layout_defaults` and for the effective
+// layout broadcast back to clients on `DisplayInfo`.
+//
+// Background / clear color is NOT part of layout. The renderer is
+// the sole authority — see `report_state` in waywallen_ipc_v3.
+message LayoutPrefs {
+  FillMode fillmode = 1;
+  Align    align    = 2;
+  Rotation rotation = 4;
+  uint32   location_x = 5; // 0..100, 50 = center
+  uint32   location_y = 6; // 0..100, 50 = center
+  bool     location_set = 7;
+  Flip     flip = 8; // Not used in GlobalSettings.layout_defaults.
+  reserved 3;
+  reserved "clear_rgba";
+}
+
+// Sparse per-display override. Each *_set flag, when true, indicates
+// that the matching field carries a real value; otherwise the field
+// is unset (= "inherit the global default"). Used on
+// `DisplayInfo.layout_override` and as the body of
+// `DisplayLayoutSetRequest`.
+message LayoutOverride {
+  bool fillmode_set = 1;
+  FillMode fillmode = 2;
+  bool align_set    = 3;
+  Align align       = 4;
+  bool rotation_set = 7;
+  Rotation rotation = 8;
+  bool   location_set = 9;
+  uint32 location_x = 10; // 0..100, 50 = center
+  uint32 location_y = 11; // 0..100, 50 = center
+  bool flip_set = 12;
+  Flip flip = 13;
+  reserved 5, 6;
+  reserved "clear_rgba_set", "clear_rgba";
+}
+
+enum LayoutSource {
+  LAYOUT_SOURCE_UNSPECIFIED = 0;
+  LAYOUT_SOURCE_GLOBAL = 1;
+  LAYOUT_SOURCE_DISPLAY = 2;
+  LAYOUT_SOURCE_WALLPAPER = 3;
+  LAYOUT_SOURCE_CANVAS = 4;
+}
+
+message DisplayInfo {
+  uint64 display_id  = 1;
+  string name        = 2;
+  uint32 width       = 3;
+  uint32 height      = 4;
+  uint32 refresh_mhz = 5;
+  repeated DisplayLinkInfo links = 6;
+  // Resolved fillmode/align/clear_rgba currently in effect for this
+  // display (per-display override applied on top of the global
+  // defaults). UI binds to this for display.
+  LayoutPrefs effective_layout = 7;
+  // The raw per-display override (sparse). UI binds to this for the
+  // edit form so it can show "inherit" vs. explicit values.
+  LayoutOverride layout_override = 8;
+  // DRM render-node id of the GPU this display's consumer is on, sourced
+  // from `register_display` in the waywallen-display protocol. Both 0 ⇒
+  // unknown (the display backend did not query it). UI cross-references
+  // against `GpuList` to show a human description.
+  uint32 drm_render_major = 9;
+  uint32 drm_render_minor = 10;
+  string alias = 11;
+  // Resolved layout from global + display preferences, before any
+  // active wallpaper-local override is applied. UI edit forms bind to
+  // this value so display settings remain independently editable.
+  LayoutPrefs display_layout = 12;
+  LayoutSource effective_layout_source = 13;
+  repeated RuntimeCondition conditions = 14;
+  string instance_id = 15;
+  string settings_key = 16;
+  string canvas_id = 17;
+  CanvasRect canvas_rect = 18;
+  uint32 canvas_overlap_count = 19;
+  bool selectable_target = 20;
+  bool manual_paused = 21;
+  bool effective_paused = 22;
+  WindowExclusionSupport window_exclusion_support = 23;
+  uint32 unsupported_window_exclusions = 24;
+}
+
+enum WindowExclusionSupport {
+  WINDOW_EXCLUSION_SUPPORT_LEGACY = 0;
+  WINDOW_EXCLUSION_SUPPORT_SUPPORTED = 1;
+  WINDOW_EXCLUSION_SUPPORT_PARTIAL = 2;
+}
+
+message CanvasRect {
+  sint32 x = 1;
+  sint32 y = 2;
+  // Canvas source-space Scale to size, not the live surface metrics.
+  uint32 width = 3;
+  uint32 height = 4;
+}
+
+message CanvasSize {
+  uint32 width = 1;
+  uint32 height = 2;
+}
+
+message CanvasMemberInfo {
+  string settings_key = 1;
+  CanvasRect rect = 2;
+  repeated uint64 display_ids = 3;
+  // Component-wise maximum live surface size for this stable member.
+  // Absent while the member is offline.
+  CanvasSize minimum_scale_to = 4;
+  bool aspect_locked = 5;
+}
+
+message CanvasInfo {
+  string canvas_id = 1;
+  string name = 2;
+  repeated CanvasMemberInfo members = 3;
+  CanvasRect extent = 4;
+  LayoutOverride layout_override = 5;
+  LayoutPrefs effective_layout = 6;
+  string wallpaper_id = 7;
+  uint64 revision = 8;
+}
+
+message CanvasMemberInput {
+  string settings_key = 1;
+  // rect.width/height is the persisted source-space Scale to size.
+  CanvasRect rect = 2;
+  bool aspect_locked = 3;
+}
+
+message CanvasListRequest {}
+message CanvasListResponse {
+  repeated CanvasInfo canvases = 1;
+  uint64 revision = 2;
+}
+
+message CanvasCreateRequest {
+  string name = 1;
+  repeated CanvasMemberInput members = 2;
+  LayoutOverride layout_override = 3;
+}
+message CanvasCreateResponse {
+  CanvasInfo canvas = 1;
+  uint64 revision = 2;
+}
+
+message CanvasUpdateRequest {
+  string canvas_id = 1;
+  uint64 expected_revision = 2;
+  string name = 3;
+  repeated CanvasMemberInput members = 4;
+  reserved 5, 6;
+  reserved "layout_override", "reset_layout_override";
+}
+message CanvasUpdateResponse {
+  CanvasInfo canvas = 1;
+  uint64 revision = 2;
+}
+
+message CanvasMemberConfigureRequest {
+  string canvas_id = 1;
+  uint64 expected_revision = 2;
+  string settings_key = 3;
+  oneof size_change {
+    uint32 width = 4;
+    uint32 height = 5;
+    bool reset_size = 6;
+  }
+  bool aspect_locked_set = 7;
+  bool aspect_locked = 8;
+}
+
+message CanvasMemberConfigureResponse {
+  CanvasInfo canvas = 1;
+  uint64 revision = 2;
+}
+
+message CanvasDeleteRequest {
+  string canvas_id = 1;
+  uint64 expected_revision = 2;
+}
+
+message CanvasLayoutSetRequest {
+  string canvas_id = 1;
+  LayoutOverride override = 2;
+  bool clear_fillmode = 3;
+  bool clear_rotation = 4;
+  bool clear_location = 5;
+  bool clear_flip = 6;
+}
+
+message CanvasLayoutSetResponse {
+  CanvasInfo canvas = 1;
+}
+
+message DisplayPauseSetRequest {
+  uint64 display_id = 1;
+  bool paused = 2;
+}
+
+message DisplayPauseSetResponse {
+  DisplayInfo display = 1;
+}
+
+message DisplayRenameRequest {
+  // Live display id to mutate. `name` is retained for older clients but
+  // is not used for target resolution.
+  string name       = 1;
+  string alias      = 2;
+  bool   clear      = 3;
+  uint64 display_id = 4;
+}
+
+message DisplayRenameResponse {
+  DisplayInfo display = 1;
+}
+
+message RemoteAvailabilityRequest {}
+
+message RemoteSortOption {
+  string key = 1;
+  string label = 2;
+  PluginMessage label_text = 3;
+}
+
+message RemoteFilterOption {
+  string value = 1;
+  string label = 2;
+  PluginMessage label_text = 3;
+}
+
+enum RemoteFilterType {
+  REMOTE_FILTER_TYPE_UNSPECIFIED = 0;
+  REMOTE_FILTER_TYPE_SELECT = 1;
+  REMOTE_FILTER_TYPE_MULTI_SELECT = 2;
+  REMOTE_FILTER_TYPE_TOGGLE = 3;
+}
+
+message RemoteFilterDef {
+  string id = 1;
+  string title = 2;
+  RemoteFilterType type = 3;
+  repeated RemoteFilterOption options = 4;
+  string description = 5;
+  string confirmation = 6;
+  PluginMessage title_text = 7;
+  PluginMessage description_text = 8;
+  PluginMessage confirmation_text = 9;
+}
+
+message RemoteSourceInfo {
+  string id = 1;
+  string name = 2;
+  bool supports_search = 3;
+  repeated RemoteSortOption sorts = 4;
+  // Flattened filter values retained for older clients.
+  repeated string tags = 5;
+  string content_dir = 6;
+  // Domain id of the owning installable plugin (e.g. org.waywallen.open-wallpaper-engine).
+  // Source settings remain keyed by this source's `id` in SettingsSet.
+  string owner_plugin_id = 7;
+  // Settings the source plugin declares via `info().settings`, so the UI can
+  // offer a config affordance for this source.
+  repeated SettingSchema settings = 8;
+  // Human-readable display name (falls back to `name`/`id`).
+  string display_name = 9;
+  // Action buttons (`info().actions`) rendered in the config page.
+  repeated PluginActionDef actions = 10;
+  // Read-only status rows (`info().status`) with daemon-computed values.
+  repeated PluginStatusRow status = 11;
+  RemoteCapability remote_capability = 12;
+  // Provider-owned explanation of the acquisition flow. The host displays it verbatim.
+  string remote_hint = 13;
+  // Provider-owned account image returned by lifecycle.check().
+  string avatar_url = 14;
+  repeated RemoteFilterDef filters = 15;
+  PluginMessage display_name_text = 16;
+  PluginMessage remote_hint_text = 17;
+}
+
+enum RemoteCapability {
+  REMOTE_CAPABILITY_UNSPECIFIED = 0;
+  REMOTE_CAPABILITY_DOWNLOAD = 1;
+  REMOTE_CAPABILITY_SUBSCRIPTION = 2;
+}
+
+enum PluginActionKind {
+  PLUGIN_ACTION_KIND_UNSPECIFIED = 0;
+  PLUGIN_ACTION_KIND_INVOKE = 1;
+  PLUGIN_ACTION_KIND_QR_LOGIN = 2;
+  PLUGIN_ACTION_KIND_FORM = 3;
+}
+
+message PluginActionField {
+  string key = 1;
+  string label = 2;
+  string description = 3;
+  string placeholder = 4;
+  bool secret = 5;
+  bool required = 6;
+  PluginMessage label_text = 7;
+  PluginMessage description_text = 8;
+  PluginMessage placeholder_text = 9;
+}
+
+message PluginActionDef {
+  string id = 1;
+  string label = 2;
+  string group = 3;
+  int32 order = 4;
+  PluginActionKind kind = 5;
+  bool visible = 6;
+  bool enabled = 7;
+  // Optional plugin-owned explanation shown beside the action.
+  string description = 8;
+  // Ephemeral inputs sent only when this action is invoked. They are not settings.
+  repeated PluginActionField fields = 9;
+  // Whether browsing this source requires this action.
+  bool required_for_browsing = 10;
+  // Optional plugin-owned explanation shown while browsing requires this action.
+  string browse_description = 11;
+  // Optional plugin-owned label for the browse login button.
+  string browse_button_label = 12;
+  PluginMessage label_text = 13;
+  PluginMessage description_text = 14;
+  PluginMessage browse_description_text = 15;
+  PluginMessage browse_button_label_text = 16;
+  PluginMessage group_label = 17;
+}
+message PluginStatusRow {
+  string id = 1;
+  string label = 2;
+  string group = 3;
+  int32 order = 4;
+  string value = 5;
+  PluginMessage label_text = 6;
+  PluginMessage group_label = 7;
+  PluginMessage value_text = 8;
+}
+
+// Trigger a plugin-declared action. The daemon routes `action_id` to the
+// owning plugin.
+message PluginActionRequest {
+  string plugin_id = 1;
+  string action_id = 2;
+  map<string, string> values = 3;
+}
+message PluginActionResponse {
+  bool accepted = 1;
+  string error = 2;
+  string session_id = 3;
+}
+
+message RemoteAvailabilityResponse {
+  repeated RemoteSourceInfo sources = 1;
+  string default_source_id = 2;
+}
+
+message RemoteItem {
+  string id = 1;
+  string title = 2;
+  string preview_url = 3;
+  string author = 4;
+  bool   downloaded = 5;
+  string source_id = 6;
+  string wp_type = 7;
+}
+
+message RemoteSearchRequest {
+  string source_id = 1;
+  string query = 2;
+  string sort_key = 3;
+  uint32 page = 4;
+  repeated string required_tags = 5;
+}
+message RemoteSearchResponse {
+  repeated RemoteItem items = 1;
+  bool   has_more = 2;
+  string error = 3;
+}
+
+message RemoteDownloadRequest {
+  string source_id = 1;
+  string id = 2;
+}
+message RemoteDownloadResponse {
+  bool   accepted = 1;
+  string error = 2;
+}
+
+message RemoteUninstallRequest {
+  string source_id = 1;
+  string id = 2;
+}
+message RemoteUninstallResponse {
+  bool   removed = 1;
+  string error = 2;
+}
+
+message RemoteDetailsRequest {
+  string source_id = 1;
+  string id = 2;
+}
+message RemoteDetailsResponse {
+  string description = 1;
+  string size = 2;
+  repeated string tags = 3;
+  string error = 4;
+  uint32 width = 5;
+  uint32 height = 6;
+  string web_url = 7;
+  // Empty unless the source knows an author it could not already put on the
+  // RemoteItem, e.g. one only its per-item endpoint reports.
+  string author = 8;
+}
+
+enum RemoteDownloadState {
+  REMOTE_DOWNLOAD_STATE_UNSPECIFIED = 0;
+  REMOTE_DOWNLOAD_STATE_PENDING = 1;
+  REMOTE_DOWNLOAD_STATE_DOWNLOADING = 2;
+  REMOTE_DOWNLOAD_STATE_DONE = 3;
+  REMOTE_DOWNLOAD_STATE_TIMEOUT = 4;
+  REMOTE_DOWNLOAD_STATE_ERROR = 5;
+}
+message RemoteDownloadProgress {
+  string source_id = 1;
+  string id = 2;
+  RemoteDownloadState state = 3;
+  string error = 4;
+}
+
+enum SubscriptionState {
+  SUBSCRIPTION_STATE_UNKNOWN = 0;
+  SUBSCRIPTION_STATE_UNSUBSCRIBED = 1;
+  SUBSCRIPTION_STATE_SUBSCRIBED = 2;
+}
+
+message SubscriptionItemState {
+  string id = 1;
+  SubscriptionState state = 2;
+}
+
+message SubscriptionStatusRequest {
+  string source_id = 1;
+  repeated string item_ids = 2;
+}
+message SubscriptionStatusResponse {
+  repeated SubscriptionItemState items = 1;
+  string error = 2;
+  PluginMessage error_text = 3;
+}
+
+message SubscriptionSetRequest {
+  string source_id = 1;
+  string item_id = 2;
+  bool subscribed = 3;
+}
+message SubscriptionSetResponse {
+  bool accepted = 1;
+  string error = 2;
+  PluginMessage error_text = 3;
+}
+
+message QrLoginCancelRequest {
+  string session_id = 1;
+}
+message QrLoginCancelResponse {
+  bool cancelled = 1;
+}
+
+// Merge declared settings into one remote source's config table. Unlike
+// SettingsSet, this request never replaces unrelated settings.
+message RemoteSettingsPatchRequest {
+  string source_id = 1;
+  map<string, string> values = 2;
+}
+
+enum QrLoginState {
+  QR_LOGIN_STATE_UNSPECIFIED = 0;
+  QR_LOGIN_STATE_STARTING = 1;
+  QR_LOGIN_STATE_AWAITING_SCAN = 2;
+  QR_LOGIN_STATE_AWAITING_CONFIRMATION = 3;
+  QR_LOGIN_STATE_CHALLENGE_CHANGED = 4;
+  QR_LOGIN_STATE_SUCCEEDED = 5;
+  QR_LOGIN_STATE_EXPIRED = 6;
+  QR_LOGIN_STATE_FAILED = 7;
+  QR_LOGIN_STATE_CANCELLED = 8;
+}
+message QrLoginProgress {
+  string session_id = 1;
+  string plugin_id = 2;
+  string action_id = 3;
+  QrLoginState state = 4;
+  string qr_image = 5;
+  string display_value = 6;
+  string error = 7;
+  string title = 8;
+  string instruction = 9;
+  PluginMessage display_value_text = 10;
+  PluginMessage error_text = 11;
+  PluginMessage title_text = 12;
+  PluginMessage instruction_text = 13;
+}
+
+message DisplayListRequest {}
+message DisplayListResponse {
+  repeated DisplayInfo displays = 1;
+}
+
+// Mutate the per-display layout override for a single display. The
+// daemon writes through to its settings store and re-emits
+// composition config to the live consumer (if any) immediately. After the
+// write the daemon also broadcasts a `DisplayChanged` event so other
+// UIs see the new effective layout.
+//
+// Update semantics: each field is taken from the override message
+// only when its matching `*_set` flag is true. To clear (revert to
+// global default), set the field's `*_set` flag false in the new
+// override AND set the corresponding `clear_*` flag below to true.
+// Sending an unspecified override leaves the override entry untouched.
+message DisplayLayoutSetRequest {
+  // Live display id to mutate. `name` is retained for older clients but
+  // is not used for target resolution.
+  string name = 1;
+  // New override values. Field set/unset behavior follows the
+  // `LayoutOverride` message rules.
+  LayoutOverride override = 2;
+  // Explicit "remove this field from the override" flags. They take
+  // precedence over `override.*_set` when both are present (set+clear
+  // resolves to clear). Useful for UI that wants to revert a single
+  // field to the global default without sending the full override.
+  bool clear_fillmode = 3;
+  bool clear_align    = 4;
+  bool clear_rotation = 6;
+  uint64 display_id   = 7;
+  bool clear_location = 8;
+  bool clear_flip = 9;
+  reserved 5;
+  reserved "clear_clear_rgba";
+}
+
+message DisplayLayoutSetResponse {
+  // Updated DisplayInfo for the affected display (with refreshed
+  // `effective_layout`). Empty if the target live display was absent.
+  DisplayInfo display = 1;
+}
+
+// ---------------------------------------------------------------------------
+// Libraries
+// ---------------------------------------------------------------------------
+
+message LibraryInstance {
+  int64 id = 1;
+  string path = 2;
+  string plugin_name = 3;
+}
+
+message LibraryListRequest {}
+message LibraryListResponse {
+  repeated LibraryInstance libraries = 1;
+}
+
+message LibraryAddRequest {
+  string path = 1;
+  string plugin_name = 2;
+}
+
+message LibraryRemoveRequest {
+  int64 id = 1;
+}
+
+// Ask every source plugin to look in well-known locations and
+// auto-register anything it finds as a new
+// library. Returns the paths that were actually added (already-known
+// paths are silently skipped).
+message LibraryAutoDetectRequest {}
+message LibraryAutoDetectResponse {
+  repeated LibraryInstance added = 1;
+}
+
+// ---------------------------------------------------------------------------
+// Server-initiated events (no request_id, carried in `ServerFrame.event`)
+// ---------------------------------------------------------------------------
+
+message Event {
+  reserved 22;
+  oneof payload {
+    DisplaySnapshot        display_snapshot          = 1;
+    DisplayChanged         display_changed           = 2;
+    DisplayRemoved         display_removed           = 3;
+    RendererSnapshot       renderer_snapshot         = 4;
+    RendererChanged        renderer_changed          = 5;
+    RendererRemoved        renderer_removed          = 6;
+    LibrarySnapshot        library_snapshot          = 7;
+    LibraryChanged         library_changed           = 8;
+    LibraryRemoved         library_removed           = 9;
+    WallpaperSyncFinished  wallpaper_sync_finished   = 11;
+    LibrariesAdded         libraries_added           = 12;
+    StatusSync             status_sync               = 13;
+    SettingsChanged        settings_changed          = 14;
+    DisplayConnectionFailed display_connection_failed = 15;
+    RemoteDownloadProgress remote_download_progress = 16;
+    PlaylistChanged        playlist_changed          = 17;
+    Empty                  plugin_update_changed     = 18;
+    TaskProgress           task_progress             = 19;
+    PluginRestartFailed    plugin_restart_failed     = 20;
+    Empty                  plugin_changed            = 21;
+    QrLoginProgress        qr_login_progress         = 23;
+    Empty                  plugin_state_changed      = 24;
+    CanvasSnapshot         canvas_snapshot           = 25;
+    WallpaperPresentationSnapshot wallpaper_presentation_snapshot = 26;
+    WallpaperHiddenChanged wallpaper_hidden_changed = 27;
+  }
+}
+
+enum WallpaperPresentationState {
+  WALLPAPER_PRESENTATION_STATE_UNSPECIFIED = 0;
+  WALLPAPER_PRESENTATION_STATE_STARTING = 1;
+  WALLPAPER_PRESENTATION_STATE_PLAYING = 2;
+  WALLPAPER_PRESENTATION_STATE_PAUSED = 3;
+  WALLPAPER_PRESENTATION_STATE_STOPPED = 4;
+}
+
+message WallpaperPresentationTarget {
+  oneof target {
+    uint64 display_id = 1;
+    string canvas_id = 2;
+  }
+}
+
+message WallpaperPresentationInfo {
+  string wallpaper_id = 1;
+  repeated WallpaperPresentationTarget targets = 2;
+  WallpaperPresentationState state = 3;
+}
+
+message WallpaperPresentationSnapshot {
+  repeated WallpaperPresentationInfo presentations = 1;
+}
+
+// Coarse daemon lifecycle. Orthogonal to `StatusSync.scan_in_progress`.
+enum DaemonPhase {
+  DAEMON_PHASE_UNSPECIFIED = 0;
+  // Booting: WS may already accept connections, but the UI should
+  // avoid firing queries (data may be empty / settings may still be
+  // reconciling). Show a startup dialog instead.
+  DAEMON_PHASE_STARTING = 1;
+  // Core services are up (WS bound, DBus published). UI can query.
+  // A scan may still be running — that's `scan_in_progress`.
+  DAEMON_PHASE_READY = 2;
+}
+
+// Snapshot of daemon-side runtime state. Pushed on WS connect and on
+// every change that affects any field (phase, scan, task lifecycle).
+// Authoritative — transient events are best-effort notifications, but
+// `StatusSync` is the field UI binds to for closed-loop state (e.g.
+// spinner visibility, startup dialog).
+message StatusSync {
+  // True while a wallpaper rescan (`refresh_sources`) is in flight.
+  bool scan_in_progress = 1;
+  // Count of TaskManager tasks currently in `Running` state.
+  uint32 active_task_count = 2;
+  // Daemon lifecycle phase. UI gates the startup dialog on this.
+  DaemonPhase phase = 3;
+  DisplayBackendStatus display_backend = 4;
+  bool global_paused = 5;
+  bool global_muted = 6;
+  bool global_stopped = 7;
+}
+
+message TaskProgress {
+  string query_id = 1;
+  float progress = 2;
+  bool progressing = 3;
+  bool ended = 4;
+  bool error = 5;
+  string message = 6;
+}
+
+message PluginRestartFailed {
+  string plugin_id = 1;
+  string error = 2;
+}
+
+message DisplayBackendStatus {
+  string name = 1;
+  string state = 2;
+  string desktop = 3;
+  string binary = 4;
+  string reason = 5;
+  string flatpak_id = 6;
+}
+
+// One or more libraries were just added — by `LibraryAdd` (one path)
+// or by `LibraryAutoDetect` (one or more). UI uses this for a toast;
+// the matching `LibraryChanged` events still drive list-state updates.
+message LibrariesAdded {
+  repeated string paths = 1;
+}
+
+// External display client failed handshake on the daemon's UDS endpoint
+// (bad protocol name or unsupported protocol version). Transient — UI
+// surfaces a toast so the user notices a stale waywallen-display binary
+// instead of silently getting no wallpapers.
+message DisplayConnectionFailed {
+  // Echoed from the rejected client's `Hello.client_name`. Empty when
+  // the failure happened before a Hello was parsed.
+  string client_name              = 1;
+  // Echoed from `Hello.client_protocol_version`. 0 when unavailable.
+  uint32 client_protocol_version  = 2;
+  // Same code as the wire `error` event (see error_code in
+  // waywallen_display_v1.xml): 1=PROTO_NAME_MISMATCH, 2=VERSION_UNSUPPORTED.
+  uint32 error_code               = 3;
+  // One-line human-readable reason with daemon-side recovery guidance.
+  string reason                   = 4;
+}
+
+// A wallpaper sync finished. `count` is the total entry count after
+// the swap; `error` is empty on success, otherwise a one-line reason.
+// UI typically reacts with a `Notify` toast and a `WallpaperList`
+// refetch — daemon does not push the list itself, only the trigger.
+// Sync start is observable via `StatusSync.scan_in_progress`.
+message WallpaperSyncFinished {
+  uint32 count = 1;
+  string error = 2;
+}
+
+// Full replacement — sent once right after the WS handshake so a
+// freshly-connected UI has a complete picture, and on any mutation that
+// touches more than one display (e.g. a batch relink).
+message DisplaySnapshot {
+  repeated DisplayInfo displays = 1;
+}
+
+// A single display was added or its fields changed (links, size, …).
+// Receivers should upsert by `display.display_id`.
+message DisplayChanged {
+  DisplayInfo display = 1;
+}
+
+// A display was unregistered. Receivers should drop the entry.
+message DisplayRemoved {
+  uint64 display_id = 1;
+}
+
+message CanvasSnapshot {
+  repeated CanvasInfo canvases = 1;
+  uint64 revision = 2;
+}
+
+// Full replacement for the active-renderer list. Sent once on WS
+// handshake and on broadcast-lag recovery.
+message RendererSnapshot {
+  repeated RendererInstance renderers = 1;
+}
+
+// A single renderer was added or its runtime fields changed (status,
+// fps). Receivers should upsert by `renderer.renderer_id`.
+message RendererChanged {
+  RendererInstance renderer = 1;
+}
+
+// A renderer was unregistered. Receivers should drop the entry.
+message RendererRemoved {
+  string renderer_id = 1;
+}
+
+// Full replacement for the library list. Sent once on WS handshake.
+message LibrarySnapshot {
+  repeated LibraryInstance libraries = 1;
+}
+
+// A single library was added or its fields changed.
+message LibraryChanged {
+  LibraryInstance library = 1;
+}
+
+// A library was removed.
+message LibraryRemoved {
+  int64 id = 1;
+}
+
+// ---------------------------------------------------------------------------
+// Settings
+// ---------------------------------------------------------------------------
+
+message GlobalRendererSettings {
+  // Master audio gate for renderers that declare an `enable_audio` setting.
+  optional bool enable_audio = 1;
+  // Percentage factor multiplied with each renderer's `volume` setting.
+  optional uint32 volume = 2;
+}
+
+message GlobalSettings {
+  reserved 23;
+  reserved "background_blur";
+  // Tag 1 / 2 used to be `default_width`/`default_height`; replaced by
+  // `target_extent` + `render_size_policy` in v7. Both were dropped in
+  // the post-extent refactor — render size is now a per-renderer
+  // decision driven by the `resolution` plugin setting.
+  reserved 1, 2, 4, 5, 9, 10;
+  reserved "default_width", "default_height", "target_extent", "render_size_policy";
+  // Structured wallpaper-browser filter state. The daemon persists it
+  // internally as JSON, but the control plane stays structured so the
+  // UI never has to serialize/parse the editor state itself.
+  repeated WallpaperFilterRule wallpaper_filters = 6;
+  repeated FilterLogic wallpaper_filter_logics = 7;
+  // Persisted wallpaper-browser sort. Same shape as `WallpaperListRequest.sorts`
+  // (composite, applied in order). Empty ⇒ daemon's default ordering.
+  repeated WallpaperSortRule wallpaper_sorts = 8;
+
+  // Note: fps is per-plugin (in PluginSettings) — different renderer
+  // engines have different sane defaults, so it's not a global field.
+  //
+  // Daemon-wide layout defaults applied when a display has no
+  // per-display override. UI sends these as the "default for new
+  // displays" preset.
+  LayoutPrefs layout_defaults = 3;
+
+  // Queue playback mode: "sequential" / "shuffle" / "random". Unknown
+  // values are coerced back to "sequential" on the daemon side.
+  string queue_mode = 11;
+
+  // Auto-rotation interval in seconds. `0` disables auto-rotation.
+  uint32 rotation_secs = 12;
+
+  // Wallpaper types the browser hides via the quick type toggles
+  // (above the structured filter rules). Persisted so the selection
+  // survives restarts.
+  repeated string wallpaper_skip_types = 13;
+
+  // Quick tag filter (independent of the rules): show only wallpapers
+  // having any of these tags. Empty = all. Persisted across restarts.
+  repeated string wallpaper_filter_tags = 14;
+
+  // Content ratings hidden by the browser's quick toggles. Persisted.
+  repeated string wallpaper_skip_content_ratings = 15;
+
+  // How the library browser treats wallpapers marked hidden. Persisted.
+  // Default EXCLUDE.
+  WallpaperHiddenFilter wallpaper_hidden_filter = 29;
+
+  // Canonical automatic replay policy.
+  AutoReplayPolicy auto_replay = 16;
+
+  // Fade duration used for both mute and unmute control messages.
+  uint32 audio_fade_ms = 17;
+
+  // Negative form preserves the default enabled behavior for older
+  // clients that never send this field.
+  bool disable_plugin_update_notifications = 18;
+
+  // When enabled, one wallpaper applied to multiple displays gets one
+  // renderer per display instead of sharing a single renderer instance.
+  bool duplicate_renderers_for_same_wallpaper = 19;
+
+  // Daemon-wide gates applied over renderer-specific settings.
+  GlobalRendererSettings renderer = 20;
+
+  // Mute wallpaper renderers while another application's active playback
+  // stream is visible through PulseAudio/PipeWire-Pulse.
+  optional bool mute_when_other_audio = 21;
+
+  // Allow audio-response wallpapers to capture the system output spectrum.
+  bool audio_capture_enabled = 22;
+
+  // Presentation effect applied while a display's bound renderer is paused.
+  PauseEffectConfig pause_effect = 24;
+
+  // Allow the daemon to forward display pointer input to subscribed renderers.
+  bool pointer_forwarding_enabled = 25;
+
+  // Hide the tray icon. The daemon applies this live; the window can
+  // be reopened by launching waywallen again. `--no-tray` overrides.
+  bool hide_tray_icon = 26;
+
+  // Raise the daemon and renderer log levels to debug. Honored unless
+  // WW_LOG is set. Applied live.
+  bool debug_logging_enabled = 27;
+
+  // Animation shown when a display switches to a different wallpaper.
+  TransitionConfig transition = 28;
+}
+
+enum AutoAction {
+  AUTO_ACTION_NONE = 0;
+  AUTO_ACTION_MUTE = 1;
+  AUTO_ACTION_PAUSE = 2;
+  AUTO_ACTION_STOP = 3;
+}
+
+enum AutoScope {
+  AUTO_SCOPE_CURRENT_DISPLAY = 0;
+  AUTO_SCOPE_ALL_DISPLAYS = 1;
+}
+
+message WindowExclusions {
+  repeated string application_ids = 1;
+  repeated string titles = 2;
+  repeated string application_id_patterns = 3;
+  repeated string title_patterns = 4;
+}
+
+message AutoReplayPolicy {
+  reserved 1, 2, 3;
+  AutoAction any_window = 10;
+  AutoAction focused = 11;
+  AutoAction maximized = 12;
+  AutoAction fullscreen = 13;
+  AutoAction session_locked = 14;
+  AutoAction session_inactive = 15;
+  optional uint32 resume_delay_ms = 16;
+  AutoScope any_window_scope = 17;
+  AutoScope focused_scope = 18;
+  AutoScope maximized_scope = 19;
+  AutoScope fullscreen_scope = 20;
+  AutoAction gamemode = 21;
+  WindowExclusions window_exclusions = 22;
+}
+
+enum PauseEffectKind {
+  PAUSE_EFFECT_KIND_NONE = 0;
+  PAUSE_EFFECT_KIND_BLUR = 1;
+}
+
+message BlurEffectConfig {
+  uint32 radius = 1;
+}
+
+message PauseEffectConfig {
+  PauseEffectKind kind = 1;
+  BlurEffectConfig blur = 2;
+}
+
+enum TransitionKind {
+  TRANSITION_KIND_NONE = 0;
+  TRANSITION_KIND_FADE = 1;
+  TRANSITION_KIND_WIPE = 2;
+  TRANSITION_KIND_GROW = 3;
+}
+
+message TransitionConfig {
+  TransitionKind kind = 1;
+  // Clamped to 100..=10000.
+  uint32 duration_ms = 2;
+  // Wipe direction in degrees, clockwise; 0 wipes left to right.
+  uint32 angle = 3;
+  // Grow center as percentages of the display surface, 0..=100.
+  uint32 origin_x = 4;
+  uint32 origin_y = 5;
+}
+
+// One plugin's settings table. Wire format is string→string for
+// uniformity; plugins parse their own values.
+message PluginSettings {
+  map<string, string> values = 1;
+}
+
+message SettingsGetRequest {}
+message SettingsGetResponse {
+  GlobalSettings global = 1;
+  // Keyed by runtime component name (renderer name or Lua source name).
+  map<string, PluginSettings> plugins = 2;
+  // Absolute path of the daemon log directory (read-only).
+  string log_dir = 3;
+  // True when WW_LOG is set in the daemon environment (read-only).
+  bool ww_log_active = 4;
+}
+
+// Full replace. The daemon overwrites global and the plugin map with
+// what's sent here. Plugins not present in the request are removed.
+message SettingsSetRequest {
+  GlobalSettings global = 1;
+  map<string, PluginSettings> plugins = 2;
+}
+
+message LogReadRequest {}
+message LogReadResponse {
+  string path = 1;
+  string content = 2;
+  bool truncated = 3;
+}
+
+// Server-initiated push: the persisted settings just changed. Carries
+// the full post-write state so a UI can rebind without a follow-up
+// `SettingsGetRequest`. Sent after every successful settings mutation and
+// after schema-driven startup reconciliation that filled in defaults or
+// dropped unknown keys.
+message SettingsChanged {
+  GlobalSettings global = 1;
+  map<string, PluginSettings> plugins = 2;
+}
+
+// Flatpak-only login startup integration through
+// org.freedesktop.portal.Background.
+message AutostartGetRequest {}
+message AutostartGetResponse {
+  bool enabled = 1;
+}
+
+message AutostartSetRequest {
+  bool enabled = 1;
+}
+message AutostartSetResponse {
+  bool enabled = 1;
+}
+
+// ---------------------------------------------------------------------------
+// Playlists
+// ---------------------------------------------------------------------------
+//
+// Filter / smart-playlist messages are intentionally absent in this
+// revision — the filter model will be reworked, so only curated
+// playlists (explicit ordered member list of DB item.id values) are
+// reachable from this surface for now. Smart playlists already
+// persisted in the DB stay activatable via PlaylistActivate; the
+// daemon handles them transparently through the resolve layer.
+
+message PlaylistChanged {
+  repeated PlaylistDisplayStatus displays = 1;
+  int64 auto_attach_id = 2;
+}
+
+enum PlaylistMode {
+  PLAYLIST_MODE_UNSPECIFIED = 0;
+  SEQUENTIAL = 1;
+  SHUFFLE    = 2;
+  RANDOM     = 3;
+}
+
+// Compact summary for listing. `item_count` is `0` for smart
+// playlists in this revision (the resolve layer doesn't materialize
+// them outside the active state) — clients should treat it as a hint,
+// not a guarantee.
+message PlaylistSummary {
+  int64  id = 1;
+  string name = 2;
+  string source_kind = 3;
+  PlaylistMode mode = 4;
+  uint32 interval_secs = 5;
+  uint32 item_count = 6;
+  repeated string entry_ids = 7;
+  int64 revision = 8;
+  bool synchronized_selection = 9;
+}
+
+message PlaylistListRequest {}
+message PlaylistListResponse {
+  repeated PlaylistSummary playlists = 1;
+}
+
+message PlaylistGetRequest {
+  int64 id = 1;
+}
+message PlaylistGetResponse {
+  PlaylistSummary playlist = 1;
+  repeated WallpaperEntry wallpapers = 2;
+}
+
+message PlaylistUpdateRequest {
+  int64 id = 1;
+  string name = 2;
+  PlaylistMode mode = 3;
+  uint32 interval_secs = 4;
+  int64 expected_revision = 5;
+  repeated string entry_ids = 6;
+  bool synchronized_selection = 7;
+}
+
+message PlaylistCreateRequest {
+  string         name = 1;
+  PlaylistMode   mode = 2;
+  uint32         interval_secs = 3;
+  repeated string entry_ids = 4;
+  bool synchronized_selection = 5;
+}
+message PlaylistCreateResponse {
+  int64 id = 1;
+}
+
+message PlaylistDeleteRequest { int64 id = 1; }
+
+message PlaylistRenameRequest {
+  int64  id = 1;
+  string name = 2;
+}
+
+message PlaylistSetItemsRequest {
+  int64           id = 1;
+  repeated string entry_ids = 2;
+  int64 expected_revision = 3;
+}
+
+message PlaylistSetModeRequest {
+  int64        id = 1;
+  PlaylistMode mode = 2;
+}
+
+message PlaylistSetIntervalRequest {
+  int64  id = 1;
+  uint32 interval_secs = 2;
+}
+
+message PlaylistActivateRequest {
+  int64 id = 1;
+  // Empty selects every live Canvas once plus every independent display.
+  repeated PresentationTarget targets = 2;
+  bool auto_attach = 3;
+}
+
+message PlaylistDeactivateRequest {
+  // Empty selects every live Canvas once plus every independent display.
+  repeated PresentationTarget targets = 1;
+  int64 clear_auto_attach = 2;
+}
+
+message PlaylistDisplayStatus {
+  uint64 display_id = 1;
+  int64  active_id = 2;
+  PlaylistMode mode = 3;
+  uint32 interval_secs = 4;
+  string current_id = 5;
+  uint32 position = 6;
+  uint32 count = 7;
+  uint32 remaining_secs = 8;
+}
+
+message PlaylistStatusRequest {}
+message PlaylistStatusResponse {
+  repeated PlaylistDisplayStatus displays = 1;
+  int64 auto_attach_id = 2;
+}
+
+message PlaylistJumpToRequest {
+  int64  id = 1;
+  string entry_id = 2;
+}
+
+// ---------------------------------------------------------------------------
+// GPU enumeration
+// ---------------------------------------------------------------------------
+//
+// Snapshot of the host's DRM devices. Daemon walks /dev/dri + sysfs at
+// startup (see `gpu::enumerate`) and caches the result; this message
+// surfaces it to the UI. Pair with `RendererInstance.drm_render_major/minor`
+// and `DisplayInfo.drm_render_major/minor` to label which GPU each
+// renderer / display is currently on.
+message GpuInfo {
+  string render_node    = 1;   // empty if no render node (rare: vgem etc.)
+  string primary_node   = 2;   // empty if no primary node
+  uint32 render_major   = 3;
+  uint32 render_minor   = 4;
+  uint32 primary_major  = 5;
+  uint32 primary_minor  = 6;
+  string pci_bdf        = 7;   // "0000:03:00.0" — empty if not a PCI device
+  uint32 vendor_id      = 8;   // PCI vendor (0x1002 / 0x10de / 0x8086 …)
+  uint32 device_id      = 9;   // PCI device
+  string driver         = 10;  // kernel driver basename: "amdgpu" / "i915" / "nvidia"
+  string description    = 11;  // best-effort human label
+  string name           = 12;  // best-effort product or chipset name
+}
+
+message GpuListRequest {}
+message GpuListResponse {
+  repeated GpuInfo gpus = 1;
+}
+
+// Install an installable plugin from a local .zip into the user plugin dir
+// ($XDG_DATA_HOME/waywallen/plugins/). The archive root must contain
+// plugin.toml. A successful install refreshes the daemon plugin runtime;
+// `needs_restart` is reserved for cases the daemon cannot hot-apply.
+message PluginInstallRequest {
+  string zip_path = 1;
+}
+message PluginInstallResponse {
+  string plugin_id = 1;
+  bool needs_restart = 2;
+}
+
+message PluginInspectRequest {
+  string zip_path = 1;
+}
+message PluginInspectResponse {
+  string plugin_id = 1;
+  string name = 2;
+  string version = 3;
+  bool has_source = 4;
+  repeated string renderers = 5;
+  bool overwrite = 6;
+  string existing_version = 7;
+  string existing_name = 8;
+  bool existing_system = 9;
+  string update = 10;
+}
+
+message PluginDeleteRequest {
+  string plugin_id = 1;
+}
+message PluginDeleteResponse {
+  string plugin_id = 1;
+  bool needs_restart = 2;
+}
+
+enum PluginUpdateState {
+  PLUGIN_UPDATE_STATE_UNSPECIFIED = 0;
+  PLUGIN_UPDATE_STATE_UNKNOWN = 1;
+  PLUGIN_UPDATE_STATE_NO_URL = 2;
+  PLUGIN_UPDATE_STATE_CHECKING = 3;
+  PLUGIN_UPDATE_STATE_UP_TO_DATE = 4;
+  PLUGIN_UPDATE_STATE_AVAILABLE = 5;
+  PLUGIN_UPDATE_STATE_FAILED = 6;
+  PLUGIN_UPDATE_STATE_UNSUPPORTED = 7;
+}
+
+message PluginUpdateInfo {
+  string plugin_id = 1;
+  PluginUpdateState state = 2;
+  string latest_version = 3;
+  string zip_url = 4;
+  string sha256 = 5;
+  string error = 6;
+  int64 checked_at_ms = 7;
+}
+
+message PluginUpdateCheckRequest {
+  // Empty checks all active plugins.
+  string plugin_id = 1;
+}
+
+message PluginUpdateCheckResponse {
+  repeated PluginUpdateInfo updates = 1;
+  string query_id = 2;
+}
+
+message PluginUpdateInstallRequest {
+  string plugin_id = 1;
+}
+
+message PluginUpdateInstallResponse {
+  string query_id = 1;
+}
+
+// Whether this daemon can actually serve the plugin as installed. A plugin
+// declares the contract it was built against (`plugin.entry_version`); the
+// daemon knows which ones it implements. When they do not meet, the plugin
+// stays listed — it is installed — but says so, with the daemon's own words.
+message PluginCompat {
+  bool compatible = 1;
+  // Empty when compatible. Daemon-authored, meant to be shown as sent.
+  string reason = 2;
+}
+
+// Installable-plugin (package) view: one entry per `[plugin]`, with the
+// renderer components it provides (carrying their settings schema so a UI
+// can offer per-plugin configuration). Source presence is a flag.
+message PluginInfo {
+  string id = 1;
+  string name = 2;
+  string version = 3;
+  bool has_source = 4;
+  repeated RendererPluginInfo renderers = 5;
+  bool system = 6;
+  string update = 7;
+  PluginUpdateInfo update_info = 8;
+  PluginCompat compat = 9;
+}
+
+message PluginListRequest {}
+message PluginListResponse {
+  repeated PluginInfo plugins = 1;
+  repeated string inactive_system = 2;
+  repeated string inactive_user = 3;
+  // What this daemon implements, so a client can explain a mismatch and a
+  // packager can check before shipping. Mirrors `SUPPORTED_ENTRY_VERSIONS`
+  // and `SPAWN_VERSION`.
+  repeated uint32 supported_entry_versions = 4;
+  uint32 spawn_version = 5;
+}
+
+message PluginTranslationListRequest {}
+message PluginTranslationDocument {
+  string plugin_id = 1;
+  string locale = 2;
+  bytes po = 3;
+}
+message PluginTranslationListResponse {
+  uint64 generation = 1;
+  repeated PluginTranslationDocument documents = 2;
+}
+
+// All distinct tag names currently in the library DB, for the wallpaper
+// browser's tag-filter picker.
+message TagListRequest {}
+message TagListResponse {
+  repeated string tags = 1;
+}
+
+// All distinct content-rating values currently in the library DB.
+message ContentRatingListRequest {}
+message ContentRatingListResponse {
+  repeated string ratings = 1;
+}

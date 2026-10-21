@@ -1,0 +1,100 @@
+syntax = "proto3";
+
+package waywallen.control.v1;
+
+enum WallpaperFilterType {
+  WALLPAPER_FILTER_TYPE_UNSPECIFIED = 0;
+  WALLPAPER_FILTER_TYPE_NAME = 1;
+  WALLPAPER_FILTER_TYPE_WP_TYPE = 2;
+  WALLPAPER_FILTER_TYPE_LIBRARY = 3;
+  WALLPAPER_FILTER_TYPE_WIDTH = 5;
+  WALLPAPER_FILTER_TYPE_HEIGHT = 6;
+  WALLPAPER_FILTER_TYPE_SIZE = 7;
+  // Uses the StringFilter payload; `value` is one content-rating name,
+  // `condition` IS / IS_NOT (CONTAINS variants collapse onto them).
+  WALLPAPER_FILTER_TYPE_CONTENT_RATING = 8;
+  // Tag predicates use the StringFilter payload; `value` is one tag
+  // name, `condition` is IS / IS_NOT (CONTAINS variants are nonsensical
+  // for tag membership and treated as IS / IS_NOT respectively).
+  WALLPAPER_FILTER_TYPE_TAG = 9;
+}
+
+enum StringCondition {
+  STRING_CONDITION_UNSPECIFIED = 0;
+  STRING_CONDITION_IS = 1;
+  STRING_CONDITION_IS_NOT = 2;
+  STRING_CONDITION_CONTAINS = 3;
+  STRING_CONDITION_CONTAINS_NOT = 4;
+}
+
+enum IntCondition {
+  INT_CONDITION_UNSPECIFIED = 0;
+  INT_CONDITION_EQUAL = 1;
+  INT_CONDITION_EQUAL_NOT = 2;
+  INT_CONDITION_LESS = 3;
+  INT_CONDITION_LESS_EQUAL = 4;
+  INT_CONDITION_GREATER = 5;
+  INT_CONDITION_GREATER_EQUAL = 6;
+}
+
+enum LogicOp {
+  LOGIC_OP_UNSPECIFIED = 0;
+  LOGIC_OP_AND = 1;
+  LOGIC_OP_OR = 2;
+}
+
+message FilterLogic {
+  LogicOp op = 1;
+  int32 group_a = 2;
+  int32 group_b = 3;
+}
+
+message WallpaperStringFilter {
+  string value = 1;
+  StringCondition condition = 2;
+}
+
+message WallpaperIntFilter {
+  int64 value = 1;
+  IntCondition condition = 2;
+}
+
+// Tag membership against a set of tags. `condition` IS means "has any of
+// these tags", IS_NOT means "has none". CONTAINS variants collapse onto
+// IS / IS_NOT. An empty `values` list imposes no constraint.
+message WallpaperTagFilter {
+  repeated string values = 1;
+  StringCondition condition = 2;
+}
+
+message WallpaperFilterRule {
+  WallpaperFilterType type = 1;
+  int32 group = 2;
+  oneof payload {
+    WallpaperStringFilter string_filter = 101;
+    WallpaperIntFilter int_filter = 102;
+    WallpaperTagFilter tag_filter = 104;
+  }
+  reserved 103;
+}
+
+enum WallpaperSortKey {
+  WALLPAPER_SORT_KEY_UNSPECIFIED = 0;
+  WALLPAPER_SORT_KEY_NAME = 1;
+  WALLPAPER_SORT_KEY_WP_TYPE = 2;
+  WALLPAPER_SORT_KEY_SIZE = 3;
+  WALLPAPER_SORT_KEY_LAST_MODIFIED = 4;
+}
+
+enum SortDirection {
+  SORT_DIRECTION_UNSPECIFIED = 0;
+  SORT_DIRECTION_ASC = 1;
+  SORT_DIRECTION_DESC = 2;
+}
+
+// Multiple rules form a stable composite sort, applied in the order
+// given (rule[0] is the primary key).
+message WallpaperSortRule {
+  WallpaperSortKey key = 1;
+  SortDirection direction = 2;
+}

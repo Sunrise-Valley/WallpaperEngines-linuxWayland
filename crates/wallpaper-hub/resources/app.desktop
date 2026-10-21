@@ -1,0 +1,11 @@
+[Desktop Entry]
+Name=Wallpaper Hub
+Comment=Wallpaper Engine style wallpaper manager for COSMIC
+Type=Application
+Icon=io.github.wallpaperhub.WallpaperHub
+Exec=wallpaper-hub %F
+Terminal=false
+StartupNotify=true
+Categories=COSMIC;Utility;
+Keywords=COSMIC
+MimeType=

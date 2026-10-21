@@ -1,0 +1,15 @@
+# control.proto / filter.proto
+
+These two files are vendored from the **waywallen** project
+(https://github.com/hypengw/waywallen), which is MIT licensed:
+
+    MIT License
+    Copyright (c) 2026 hypengw
+
+They are compiled by `build.rs` (prost) to provide the wallpaper-entry /
+filter data model used by the wrapper in `src/wp/proto.rs`. No protocol
+endpoint from that project is used: Wallpaper Hub talks to its own kernel over
+the JSON control plane in `crates/we-native`.
+
+Changes from upstream: none. If you update them, keep the field names intact —
+the UI's scanning code constructs these structs directly.

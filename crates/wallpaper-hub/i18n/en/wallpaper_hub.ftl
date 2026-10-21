@@ -1,0 +1,9 @@
+app-title = Wallpaper Hub
+app-comment = Wallpaper Engine style wallpaper manager for COSMIC
+app-keywords =
+about = About
+repository = Repository
+view = View
+welcome = Welcome to COSMIC! ✨
+page-id = Page { $num }
+git-description = Git commit {$hash} on {$date}

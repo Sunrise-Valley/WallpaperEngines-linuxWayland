@@ -1,0 +1,30 @@
+[package]
+name = "we-native"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Native Wayland layer-shell wallpaper kernel: one surface per output, JSON control plane, host for the scene renderer"
+
+[dependencies]
+# xkbcommon is disabled: the kernel never needs keyboard input.
+smithay-client-toolkit = { version = "0.20", default-features = false, features = ["calloop"] }
+# SCTK 0.20 does not re-export wayland-client, so it is a direct dependency.
+wayland-client = "0.31"
+# Zero-copy needs a raw wl_display pointer (EGL wayland platform): sys backend only.
+wayland-backend = { version = "0.3", features = ["client_system"] }
+# viewporter: fractional scaling (render at physical size, set_destination to logical size).
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }
+# COSMIC's own protocol (zcosmic_toplevel_info_v1) codegen; it is a proc-macro, hence a normal dependency.
+wayland-scanner = "0.31"
+# SIGSTOP/SIGCONT of the renderer child so decoding really stops while occluded.
+libc = "0.2"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+we-scene-render = { path = "../we-scene-render" }
+we-scene = { path = "../we-scene" }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

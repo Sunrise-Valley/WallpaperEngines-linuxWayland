@@ -1,0 +1,13 @@
+# COSMIC protocol descriptions
+
+These XML files are the Wayland protocol descriptions for COSMIC's toplevel-info and
+workspace protocols, as published by the COSMIC project (cosmic-protocols). Each file
+carries its own copyright and permission notice in the `<copyright>` element, which
+permits use, modification and redistribution with the notice retained.
+
+`cosmic-combined.xml` is a merge of the individual files so that `wayland-scanner` can
+generate interfaces and client code for both in one pass (interface names unchanged).
+
+They are used by `src/cosmic_toplevel.rs` to know which window is fullscreen, which drives
+the kernel's sleep policy. They are protocol descriptions only — no COSMIC code is
+vendored.

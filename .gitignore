@@ -1,0 +1,39 @@
+# build output
+target/
+**/target/
+
+# Wallpaper Engine assets must never be committed (see README "Legal")
+*.pkg
+*.tex
+*.mdl
+*.mp4
+*.webm
+*.wav
+*.ogg
+
+# evidence / scratch / vendored third-party trees
+artifacts/
+scratch/
+vendor/
+shots/
+*.log
+
+# large images: thumbnails and reference frames do not belong in git
+*.png
+*.jpg
+*.jpeg
+!crates/wallpaper-hub/resources/icons/**/*.png
+
+# editor / OS noise
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# python
+__pycache__/
+*.pyc
+
+# local env
+.env
+*.local

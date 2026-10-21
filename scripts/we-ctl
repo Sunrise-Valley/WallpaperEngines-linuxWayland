@@ -1,0 +1,341 @@
+#!/usr/bin/env python3
+"""we-ctl —— 自研壁纸内核（we-native）的控制面客户端。
+
+内核以 `we-native --serve <socket>` 常驻；本工具往那个 socket 发一行 JSON，读回一行 JSON。
+
+用法:
+  ./we-ctl status
+  ./we-ctl apply-image /path/to.jpg
+  ./we-ctl apply-video /path/to.mp4
+  ./we-ctl apply-scene /path/to/workshop/431960/<id>     # WE scene 壁纸目录（自研渲染器）
+  ./we-ctl pause | resume | quit
+  ./we-ctl mouse <x,y>                                   # 鼠标位置（归一化 0..1，y 向下；与内核同一口径）
+  ./we-ctl dump <前缀> [张数=10] [--output]              # 帧转储：把接下来 N 帧的上屏画面存成 PNG（内核侧渲染；上限 10 帧，编码在内核 worker 线程）
+                                                        #   --output：抓**合成器合成之后**的输出帧（raw 像素，上限 600；"屏上对不对"的硬证据）
+  ./we-ctl audio on [monitor|own|static] | audio off | audio bands=0.1,0.2,...   # 音频频谱（粒子音频响应）
+  ./we-ctl audio sinks                                   # 列出可用 sink（id / 名字 / 描述，标记默认）
+  ./we-ctl audio sink=<id|名字|default|all>              # 音频分析跟哪一路输出（default 跟随系统）
+  ./we-ctl set fps=30 scale=physical effects=all sleep=never sound=on fit=cover   # 改设置（见下）
+  ./we-ctl set time_scale=1.5 volume=40   # 播放速度（0.25~3.0×，只乘场景时间）/ 音乐音量（0~100%，默认 sink）
+  ./we-ctl set-prop name=value [name=value ...] [--clear] # 用户属性覆盖（壁纸参数页同一张表）
+  ./we-ctl --socket /run/user/1000/we-native.sock status     # 指定 socket
+
+默认 socket: $XDG_RUNTIME_DIR/we-native.sock
+
+set 的可写字段（值域与内核一致，写错了这里就报错，不用等内核回执）：
+  fps=1..240                         每秒最多画多少帧（内核会夹到 1..240）
+  scale=logical|physical             渲染尺寸用逻辑尺寸还是物理尺寸
+  effects=none|all                   特效链开不开
+  sleep=never|fullscreen|maximized   挡屏时睡不睡：永不 / 真全屏或铺满 / 连最大化也算（省电档）
+  sound=on|off                       scene 的配乐（sound 对象）总开关
+  fit=cover|stretch|center|contain   取景模式：铺满裁边 / 拉伸铺满 / 1:1 居中 / 整张缩进留黑（中英文都认）
+  color=亮度,对比度,饱和度,色相,色温,伽马   色彩调整六个浮点，单位值 = 1,1,1,0,0,1（如 1.1,1.1,1.2,0,0.1,1.0）
+  time_scale=0.25..3.0               播放速度（**新能力**：乘的是场景时间；音频/鼠标不受影响）
+  volume=0..100                      音乐音量（调**默认 sink** 的 volume；回执/status 报回读的实际值）
+只写想改的字段即可（`set fps=24` 也行）；这些字段全是机制，怎么组合是界面（三档预设）的事。
+
+`set-prop` 是**壁纸自己的**用户属性（`project.json general.properties` 里的 bool/滑块/颜色/下拉/文本），
+内核只当搬运工、不认识任何属性名：`we-ctl set-prop newproperty=2 text="Mouse pad" text5="1 1 1"`；
+值里有空格要加引号。`--clear` 先清空整张表再写（不带任何 `k=v` 时就是"全部回到壁纸默认值"）。
+
+`audio sink=` 的值域：`default`（跟随系统默认输出）/ sink 的数字 id / sink 的节点名（如
+`alsa_output.pci-0000_09_00.1.hdmi-stereo`，也可以直接抄 `pactl` 的 `xxx.monitor`）/ `all`
+（**如实报不支持**：一次只跟一个 monitor）。切换只影响**音频分析**采哪一路，不改系统默认输出。
+"""
+import json
+import os
+import socket
+import sys
+
+DEFAULT_SOCK = os.path.join(
+    os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"), "we-native.sock"
+)
+
+
+def send(sock_path: str, req: dict) -> dict:
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+        s.settimeout(10)
+        s.connect(sock_path)
+        s.sendall((json.dumps(req, ensure_ascii=False) + "\n").encode())
+        buf = b""
+        while not buf.endswith(b"\n"):
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            buf += chunk
+    text = buf.decode(errors="replace").strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return {"ok": False, "error": f"内核回了看不懂的东西：{text!r}"}
+
+
+AUDIO_USAGE = (
+    "用法: we-ctl audio on [monitor|own|static] | audio off | audio bands=0.1,0.2,...\n"
+    "      we-ctl audio sinks                      # 列出可用 sink\n"
+    "      we-ctl audio sink=<id|名字|default|all> # 分析跟哪一路输出"
+)
+SETPROP_USAGE = (
+    "用法: we-ctl set-prop <名字>=<值> [<名字>=<值> ...] [--clear]\n"
+    "      we-ctl set-prop --clear                  # 清空整张覆盖表（回到壁纸默认值）\n"
+    "值里有空格要加引号：set-prop text=\"Mouse pad\" text5=\"1 1 1\"\n"
+    "名字/值的含义由壁纸自己的 project.json 决定，内核不认识任何属性名。"
+)
+
+
+def print_sinks(res: dict) -> None:
+    """把 `audio sinks` 的回执打成人类可读的一行一条（id / 名字 / 描述 / 默认标记）。"""
+    sinks = res.get("sinks") or []
+    if not sinks:
+        print("（内核没报出任何可用 sink）", file=sys.stderr)
+        return
+    print(f"可用 sink（{len(sinks)} 个；当前分析跟：{res.get('selected') or '?'}）：")
+    for s in sinks:
+        mark = "  ← 默认" if s.get("default") else ""
+        print(f"  [{s.get('id')}] {s.get('name')}")
+        print(f"        {s.get('desc')}{mark}")
+    if res.get("default"):
+        print(f"系统默认输出：{res['default']}")
+    if res.get("note"):
+        print(f"备注：{res['note']}")
+
+
+def main(argv: list[str]) -> int:
+    args = list(argv)
+    sock_path = DEFAULT_SOCK
+    if "--socket" in args:
+        i = args.index("--socket")
+        sock_path = args[i + 1]
+        del args[i : i + 2]
+
+    if not args:
+        print(__doc__)
+        return 2
+    cmd = args[0]
+    req: dict
+    # 只有 `audio sinks` 走这条：回执打完要顺手打一份人类可读的表
+    want_sink_table = False
+    if cmd == "status":
+        req = {"cmd": "status"}
+    elif cmd in ("apply-image", "apply-video", "apply-scene"):
+        if len(args) < 2:
+            print(f"用法: we-ctl {cmd} <路径>", file=sys.stderr)
+            return 2
+        kind = {"apply-image": "image", "apply-video": "video", "apply-scene": "scene"}[cmd]
+        req = {"cmd": "apply", "kind": kind, "path": os.path.abspath(args[1])}
+    elif cmd in ("pause", "resume", "quit"):
+        req = {"cmd": cmd}
+    elif cmd == "audio":
+        # 音频频谱通道（粒子音频响应）：on/off/source/bands + sink 选择/枚举
+        #   source: monitor（默认，抓 sink 回环）| own（只采壁纸自己的音轨）| static（静态频谱，测试用）
+        sub = args[1] if len(args) > 1 else "status"
+        if sub in ("sinks", "list-sinks", "list"):
+            req = {"cmd": "audio", "sinks": True}
+            want_sink_table = True
+        elif sub == "sink":
+            # `audio sink <值>` 与 `audio sink=<值>` 两种写法都收
+            target = args[2] if len(args) > 2 else ""
+            if not target:
+                print(AUDIO_USAGE, file=sys.stderr)
+                return 2
+            req = {"cmd": "audio", "sink": target}
+        elif sub.startswith("sink="):
+            target = sub[len("sink="):]
+            if not target:
+                print("sink= 后面要写 id / 名字 / default / all", file=sys.stderr)
+                return 2
+            req = {"cmd": "audio", "sink": target}
+        elif sub in ("on", "enable", "1"):
+            req = {"cmd": "audio", "on": True}
+            if len(args) > 2:
+                req["source"] = args[2]
+        elif sub in ("off", "disable", "0"):
+            req = {"cmd": "audio", "on": False}
+        elif sub.startswith("bands="):
+            raw = sub[len("bands="):]
+            try:
+                vals = [float(x) for x in raw.replace(",", " ").split()]
+            except ValueError:
+                print("bands 必须是数字（可用逗号或空格分隔）：bands=0.1,0.2,...", file=sys.stderr)
+                return 2
+            req = {"cmd": "audio", "bands": vals}
+        elif sub in ("status", "?"):
+            req = {"cmd": "status"}          # status 里就带 audio / audio_sink 字段
+        else:
+            print(AUDIO_USAGE, file=sys.stderr)
+            return 2
+    elif cmd == "dump":
+        # 帧转储：内核把接下来 N 帧的**上屏画面**额外渲一份存成 PNG（不经截图/合成器）。
+        # 用法: we-ctl dump <前缀> [张数=10] [--output]
+        #   --output ⇒ 走 **合成后取帧**（ext_image_copy_capture 的 output 会话）：
+        #     拿的是**合成器合成之后**的输出帧，原始像素直接落盘（<前缀>_0000.raw + <前缀>.txt），
+        #     不解码、不压缩。上限 600 帧；不压缩是刻意的（内核里压 PNG 一张要 ~180ms，
+        #     30 帧就是 5 秒的主循环停顿）。"屏上到底对不对"只有这一路能给硬证据。
+        # 上限 10 帧（内核侧也夹一次；见 docs/QUEUE.md N22：每帧要多画一遍 + 回读，
+        # 40 帧会把主循环推到秒级，看门狗会当成停摆）。
+        # 前缀在这里就转绝对路径：内核的 cwd 是服务的工作目录，相对路径会落到意料之外的地方。
+        source = "scene"
+        rest = [a for a in args[1:] if a != "--output"]
+        if len(rest) < len(args) - 1:
+            source = "output"
+        if len(rest) < 1:
+            print(
+                "用法: we-ctl dump <前缀> [张数=10] [--output]（--output = 合成器合成之后的帧，上限 600）",
+                file=sys.stderr,
+            )
+            return 2
+        prefix = os.path.abspath(rest[0])
+        count = 10
+        if len(rest) > 1:
+            try:
+                count = int(rest[1])
+            except ValueError:
+                print(f"张数要整数，看到的是：{rest[1]}", file=sys.stderr)
+                return 2
+            if count < 1:
+                print(f"张数至少 1，看到的是：{count}", file=sys.stderr)
+                return 2
+        req = {"cmd": "dump", "prefix": prefix, "count": count, "source": source}
+    elif cmd == "mouse":
+        # 鼠标位置（屏幕归一化 [0,1]，y 向下）——与内核 {"cmd":"mouse"} 同一口径。
+        # 用法: we-ctl mouse 0.5,0.5   或   we-ctl mouse 0.5 0.5
+        if len(args) < 2:
+            print("用法: we-ctl mouse <x,y> 或 we-ctl mouse x y（归一化 0..1）", file=sys.stderr)
+            return 2
+        raw = " ".join(args[1:]).replace(",", " ").split()
+        if len(raw) != 2:
+            print("需要两个数：x 和 y", file=sys.stderr)
+            return 2
+        try:
+            x, y = float(raw[0]), float(raw[1])
+        except ValueError:
+            print("x/y 必须是数字（归一化 0..1）", file=sys.stderr)
+            return 2
+        if not (0.0 <= x <= 1.0 and 0.0 <= y <= 1.0):
+            print("x/y 必须在 0..1 之间（屏幕归一化）", file=sys.stderr)
+            return 2
+        req = {"cmd": "mouse", "x": x, "y": y}
+    elif cmd == "set-prop":
+        # 用户属性覆盖（壁纸参数页的 bool / 滑块 / 颜色 / 下拉 / 文本全走这条）。
+        # 内核侧早有 serve::Cmd::SetProp（main.rs:545 解析、2831 落表 + 重建），但 CLI 从来没接
+        # ⇒ `we-ctl set-prop` 只会报"未知子命令"。纯客户端补齐，不改内核。
+        clear = False
+        pairs = []
+        for tok in args[1:]:
+            if tok == "--clear":
+                clear = True
+            else:
+                pairs.append(tok)
+        props = {}
+        for tok in pairs:
+            if tok.find("=") < 0:
+                print(f"要写成 名字=值 的形式，看到的是：{tok}", file=sys.stderr)
+                print("（值里有空格请加引号，如 text=\"Mouse pad\"）", file=sys.stderr)
+                print(SETPROP_USAGE, file=sys.stderr)
+                return 2
+            k, v = tok.split("=", 1)
+            if not k:
+                print(f"属性名不能为空，看到的是：{tok}", file=sys.stderr)
+                return 2
+            # 同名后者覆盖：内核是逐条写入、后写生效，这里保持同一语义
+            props[k] = v
+        if not props and not clear:
+            print(SETPROP_USAGE, file=sys.stderr)
+            return 2
+        req = {"cmd": "set-prop", "props": props, "clear": clear}
+    elif cmd == "set":
+        # 值域在这里先校验一遍：写错了立刻报错，而不是发出去等内核静默忽略
+        allowed = {
+            "scale": ("logical", "physical"),
+            "effects": ("none", "all"),
+            "sleep": ("never", "fullscreen", "maximized"),
+            # scene 的配乐总开关（sound 对象）；`WE_SOUND=0` 也能全局关掉
+            "sound": ("on", "off"),
+            # 取景模式：画布比例 ≠ 屏幕比例时怎么放（中英文都认，跟渲染器一致）
+            "fit": ("cover", "stretch", "center", "contain", "覆盖", "拉伸", "居中", "包含"),
+        }
+        if len(args) < 2:
+            print("用法: we-ctl set <字段=值> [字段=值 ...]", file=sys.stderr)
+            print("  fps=1..240  scale=logical|physical  effects=none|all  "
+                  "sleep=never|fullscreen|maximized  sound=on|off  "
+                  "fit=cover|stretch|center|contain  color=亮度,对比度,饱和度,色相,色温,伽马  "
+                  "time_scale=0.25..3.0  volume=0..100",
+                  file=sys.stderr)
+            return 2
+        req = {"cmd": "set"}
+        for pair in args[1:]:
+            if "=" not in pair:
+                print(f"要写成 字段=值 的形式，看到的是：{pair}", file=sys.stderr)
+                return 2
+            k, v = pair.split("=", 1)
+            if k == "fps":
+                try:
+                    n = int(v)
+                except ValueError:
+                    print(f"fps 要整数，看到的是：{v}", file=sys.stderr)
+                    return 2
+                if not 1 <= n <= 240:
+                    print(f"fps 要在 1..240，看到的是：{n}", file=sys.stderr)
+                    return 2
+                req["fps"] = n
+            elif k == "time_scale":
+                try:
+                    ts = float(v)
+                except ValueError:
+                    print(f"time_scale 要数字，看到的是：{v}", file=sys.stderr)
+                    return 2
+                if not 0.25 <= ts <= 3.0:
+                    print(f"time_scale 要在 0.25..3.0，看到的是：{ts}", file=sys.stderr)
+                    return 2
+                req["time_scale"] = ts
+            elif k == "volume":
+                try:
+                    vol = float(v)
+                except ValueError:
+                    print(f"volume 要数字，看到的是：{v}", file=sys.stderr)
+                    return 2
+                if not 0.0 <= vol <= 100.0:
+                    print(f"volume 要在 0..100，看到的是：{vol}", file=sys.stderr)
+                    return 2
+                req["volume"] = vol
+            elif k == "color":
+                # 六个逗号分隔的浮点：亮度,对比度,饱和度,色相,色温,伽马（单位值 1,1,1,0,0,1）
+                parts = v.split(",")
+                if len(parts) != 6:
+                    print(f"color 要六个逗号分隔的数（亮度,对比度,饱和度,色相,色温,伽马），"
+                          f"看到的是：{v}", file=sys.stderr)
+                    return 2
+                try:
+                    [float(t) for t in parts]
+                except ValueError:
+                    print(f"color 每一项都要是数字，看到的是：{v}", file=sys.stderr)
+                    return 2
+                req["color"] = v
+            elif k in allowed:
+                if v not in allowed[k]:
+                    print(f"{k} 只能是 {'|'.join(allowed[k])}，看到的是：{v}", file=sys.stderr)
+                    return 2
+                req[k] = v
+            else:
+                print(f"未知字段：{k}（只有 fps/scale/effects/sleep/sound/fit/color/time_scale/volume）", file=sys.stderr)
+                return 2
+    else:
+        print(f"未知子命令：{cmd}", file=sys.stderr)
+        return 2
+
+    if not os.path.exists(sock_path):
+        print(f"找不到内核 socket：{sock_path}（内核要先 --serve 起来）", file=sys.stderr)
+        return 3
+    try:
+        res = send(sock_path, req)
+    except OSError as e:
+        print(f"连不上内核：{e}", file=sys.stderr)
+        return 3
+    if want_sink_table and res.get("ok"):
+        print_sinks(res)
+    print(json.dumps(res, ensure_ascii=False, indent=2))
+    return 0 if res.get("ok") else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
