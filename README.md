@@ -168,12 +168,31 @@ crates/wallpaper-hub/target/release/wallpaper-hub
 
 ## Install (Debian/Ubuntu)
 
+> ### ⚠️ Read this first: the prebuilt package needs `libc6 >= 2.43`
+>
+> The `.deb` in [`dist/`](dist/) was built on **Debian forky** and therefore declares
+> **`libc6 (>= 2.43)`**. It will **not install** on Debian 13 (trixie), Ubuntu 24.04/22.04,
+> or any older distribution — `apt` will stop with *unmet dependencies*.
+>
+> This is a build-host artifact, not a hard requirement of the code. To get a package that
+> matches your system, build it **on that system**:
+>
+> ```sh
+> git clone https://github.com/Sunrise-Valley/WallpaperEngines-linuxWayland
+> cd WallpaperEngines-linuxWayland
+> packaging/build-deb.sh          # needs a Rust toolchain + the dev headers in docs/BUILDING.md
+> sudo apt install ./dist/wallpaper-hub_0.1.0_amd64.deb
+> ```
+>
+> Read `libc6` of your own system with `ldd --version | head -1`; if it is below 2.43 the
+> prebuilt file is not for you.
+
 A prebuilt `amd64` package is built from this tree; you do not need a Rust toolchain to
 install it.
 
 ```sh
 # 1. get the package (release asset, or build it yourself: see below)
-sudo apt install ./wallpaper-hub_0.1.0_amd64.deb
+sudo apt install ./dist/wallpaper-hub_0.1.0_amd64.deb   # file lives in dist/ in this repo
 
 # 2. start it for the current user; the units are user units, no root involved
 systemctl --user daemon-reload
