@@ -114,7 +114,8 @@ pub fn cmd_set_time_scale(v: f32) -> String {
     format!(r#"{{"cmd":"set","time_scale":{v:.3}}}"#)
 }
 
-/// **音乐音量**：`{"cmd":"set","volume":55}`（0..100 百分比，内核调默认 sink 的 volume）。
+/// **场景音频音量**：`{"cmd":"set","volume":55}`（0..100 百分比，内核只调**自己那条播放流**的音量，
+/// 系统 sink 一动不动 —— per-stream，见 `we-native` 的 `audio_sinks`）。
 pub fn cmd_set_volume(v: f32) -> String {
     let v = v.clamp(0.0, 100.0);
     format!(r#"{{"cmd":"set","volume":{v:.1}}}"#)
@@ -1260,7 +1261,7 @@ mod throttle_tests {
         assert!(!is_status_line(&sp("1 1 1")));
     }
 
-    /// 两个新旋钮（播放速度 / 音乐音量）的请求行**精确**（无反斜杠、值是数字），
+    /// 两个新旋钮（播放速度 / 场景音频音量）的请求行**精确**（无反斜杠、值是数字），
     /// 且各用**自己的合并键** —— 拖速度不能把音量那条也吃掉。
     #[test]
     fn time_scale_and_volume_lines_are_exact_and_coalesce_per_knob() {

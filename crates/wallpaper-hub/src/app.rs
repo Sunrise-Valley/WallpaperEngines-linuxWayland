@@ -164,8 +164,8 @@ pub struct AppModel {
     /// 内核**播放速度**（场景时间倍率，0.25..3.0，默认 1.0）。滑杆拖动时每帧变一次，
     /// 出站队列按 key 合并 + 55 ms 节流（≤18 Hz），松手 `SliderRelease` 立刻放行终值。
     time_scale: f32,
-    /// 内核**音乐音量**（默认 sink 的 volume，0..100）。启动读一次实际值（`read_sink_volume`），
-    /// 之后由滑杆驱动；`None` = 读不到（界面显示"未知"，不假装 0）。
+    /// 内核**场景音频音量**（0..100，默认 100%）。只调内核**自己那条播放流**的音量
+    /// （per-stream），**不是**系统音量 —— 与系统音量条互不影响（用户 2026-10-22 的 bug）。
     music_vol: Option<f32>,
 
     /// 角落资源条：上次 CPU 采样（累计 CPU 秒, 采样时刻）＋算出来的占用率
@@ -373,7 +373,7 @@ pub enum Message {
     SetCardSize(usize),
     /// **播放速度**滑杆（0.25..3.0，步进 0.05）—— 只乘内核的场景时间
     TimeScaleSet(f32),
-    /// **音乐音量**滑杆（0..100）—— 调内核默认 sink 的 volume
+    /// **场景音频音量**滑杆（0..100）—— 只调内核自己那条播放流，不动系统音量
     MusicVolumeSet(f32),
     /// 任一滑杆**松手**：立刻放行出站队列里的终值（不等节流窗口）
     SliderRelease,
@@ -593,7 +593,7 @@ impl cosmic::Application for AppModel {
         // 验收专用（本机 Wayland 下没有输入模拟工具）：
         // card-size 小|中|大|0..2 卡片档（走和「尺寸」滑杆**完全相同**的 Message）
         // time-scale <0.25..3> 单次设播放速度（走 TimeScaleSet）
-        // volume <0..100> 单次设音乐音量（走 MusicVolumeSet）
+        // volume <0..100> 单次设场景音频音量（走 MusicVolumeSet）
         let arg_of = |name: &str| -> Option<String> {
             args.iter()
                 .position(|a| *a == name)
@@ -806,11 +806,11 @@ impl cosmic::Application for AppModel {
             discover_error: None,
             discover_page: 1,
             discover_sort: 0,
-            // 卡片尺寸 / 播放速度 / 音乐音量（后两项的初值：速度 1.0 = 官方口径；
-            // 音量**读一次**当前 sink 的实际值，见 `read_sink_volume`）
+            // 卡片尺寸 / 播放速度 / 场景音频音量（速度 1.0 = 官方口径；
+            // 音量默认 100% —— **不读**系统音量：那是别的东西，读进来就跟着 PC 的音量条跑了）
             card_idx: card_size_arg.unwrap_or(CARD_DEFAULT),
             time_scale: 1.0,
-            music_vol: read_sink_volume(),
+            music_vol: Some(SCENE_VOLUME_DEFAULT),
             // workshop-select <工坊id>：发现页结果一到就选中这条（截图用，等价于点缩略图）
             pending_workshop_select: args
                 .iter()
@@ -1265,7 +1265,7 @@ impl cosmic::Application for AppModel {
                             self.config.fit_mode.clone()
                         };
                         native::request_async(native::cmd_set_fit(&fit));
-                        // 播放速度 / 音乐音量也补一次（内核重启后不记得；音量按界面记的实际值）
+                        // 播放速度 / 场景音频音量也补一次（内核重启后不记得；音量按界面记的实际值）
                         native::request_async(native::cmd_set_time_scale(self.time_scale));
                         if let Some(v) = self.music_vol {
                             native::request_async(native::cmd_set_volume(v));
@@ -2060,9 +2060,9 @@ impl cosmic::Application for AppModel {
                 let line = native::cmd_set_volume(v);
                 eprintln!("[控制面] set volume={v:.0}");
                 if !native::request_async(line) {
-                    self.error = Some("内核没连上：音乐音量这次只记在界面上".into());
+                    self.error = Some("内核没连上：场景音频音量这次只记在界面上".into());
                 }
-                self.native_note = Some(format!("音乐音量 → {v:.0}%"));
+                self.native_note = Some(format!("场景音频 → {v:.0}%"));
             }
             // 松手：立刻放行队列里的终值（不等下一个 55 ms 窗口）。
             Message::SliderRelease => {
@@ -4135,7 +4135,7 @@ impl AppModel {
 
         // ── 引擎内置（本程序自己的运行时项：取景 + 画面色彩）──
         rows = rows.push(self.engine_row_fit());
-        // 用户 「已安装壁纸的属性里加两个调节项」—— 播放速度 / 音乐音量。
+        // 用户 「已安装壁纸的属性里加两个调节项」—— 播放速度 / 场景音频音量。
         // 都是**内核运行时**旋钮（跟壁纸作者属性无关，也不落盘到 project.json）。
         rows = rows.push(self.engine_row_speed());
         rows = rows.push(self.engine_row_volume());
@@ -4521,22 +4521,23 @@ impl AppModel {
         )
     }
 
-    /// **引擎内置项**·音乐音量：滑杆 0~100%（默认 = 启动时读到的 sink 实际值）。
-    /// 内核调的是**默认 sink 的 volume**（壁纸自己的 sound 就播在它上面），回读实际值；
+    /// **引擎内置项**·场景音频音量：滑杆 0~100%（默认 100%）。
+    /// 内核调的是**它自己那条播放流**的音量（per-stream，`pactl set-sink-input-volume`），
+    /// **不是**系统音量 —— 拖它不会动 PC 的音量条（用户 2026-10-22 的 bug）。
     /// 界面这里只保留最后一次的值，拖动中的显示不等回执。
     fn engine_row_volume<'a>(&self) -> Element<'a, Message> {
-        let v = self.music_vol.unwrap_or(0.0).clamp(0.0, 100.0) as f64;
+        let v = self.music_vol.unwrap_or(100.0).clamp(0.0, 100.0) as f64;
         let track = widget::slider(0.0..=100.0, v, |nv: f64| Message::MusicVolumeSet(nv as f32))
             .step(1.0)
             .on_release(Message::SliderRelease)
             .class(we_ui::slider_class());
         let text = match self.music_vol {
             Some(v) => format!("{v:.0}%"),
-            None => "未知".to_string(),
+            None => "100%".to_string(),
         };
         we_ui::prop_row(
             Some("audio-volume-high-symbolic"),
-            "音乐音量",
+            "场景音频",
             we_ui::slider_row(track.into(), text),
         )
     }
@@ -5147,46 +5148,14 @@ fn workshop_url(id: &str) -> String {
     format!("https://steamcommunity.com/sharedfiles/filedetails/?id={id}")
 }
 
-/// **纯函数**：从 `pactl get-sink-volume` 的输出里取第一个百分比。
-/// 形态（实测本机 PipeWire 1.6.9）：
-/// `Volume: front-left: 26241 / 40% / -23.85 dB, front-right: …`
-fn parse_pactl_volume(text: &str) -> Option<f32> {
-    for line in text.lines() {
-        let Some(rest) = line.trim_start().strip_prefix("Volume:") else {
-            continue;
-        };
-        let chars: Vec<char> = rest.chars().collect();
-        let mut i = 0;
-        while i < chars.len() {
-            if chars[i].is_ascii_digit() {
-                let start = i;
-                while i < chars.len() && (chars[i].is_ascii_digit() || chars[i] == '.') {
-                    i += 1;
-                }
-                if i < chars.len() && chars[i] == '%' {
-                    return chars[start..i].iter().collect::<String>().parse().ok();
-                }
-            } else {
-                i += 1;
-            }
-        }
-    }
-    None
-}
-
-/// 读一次**系统默认 sink 的实际音量**（0..100）。读不到 ⇒ `None`（界面显示"未知"）。
-/// 只读一次（启动时），默认值取当前 sink 的实际音量。之后的改动由内核回读，
-/// 界面不自己轮询 `pactl`（不在渲染路径上起子进程）。
-fn read_sink_volume() -> Option<f32> {
-    let out = std::process::Command::new("pactl")
-        .args(["get-sink-volume", "@DEFAULT_SINK@"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    parse_pactl_volume(&String::from_utf8_lossy(&out.stdout))
-}
+/// 「场景音频」滑杆的默认档：**100%**。
+///
+/// 以前这里是"启动读一次系统默认 sink 的实际音量"（`pactl get-sink-volume`）—— 那是个
+/// 错误的口径：滑杆调的是**壁纸自己那条播放流**（per-stream，内核侧
+/// `pactl set-sink-input-volume`），跟系统音量条是两回事。拿系统音量当初值，等于让
+/// 壁纸的音量跟着 PC 的音量条跑，用户一拖又把 PC 的音量改了（2026-10-22 的 bug）。
+/// 默认档就该是"壁纸配乐满音量"，系统音量由系统自己管。
+const SCENE_VOLUME_DEFAULT: f32 = 100.0;
 
 /// 字节流里的图片尺寸 —— **只读文件头**（`into_dimensions`），不整张解码。
 /// 界面每帧不用它（尺寸在插入时量好），只在宣传图上屏那一刻调一次。
@@ -6723,15 +6692,36 @@ mod layout_tests {
         assert_eq!(a, b, "同参数必须命中缓存");
     }
 
-    /// 启动时读 sink 音量：解析 `pactl get-sink-volume` 的真实输出（含多声道/小数/垃圾行）。
+    /// 场景音频滑杆的默认档 = **100%**，且**不再**去读系统 sink 的音量（那会把 PC 音量拖进来）。
+    /// 用户 2026-10-22：「为什么软件调整声音后，PC 音量变了？」—— 口径必须是 per-stream，
+    /// 初值不能从 `pactl get-sink-volume` 抄。
     #[test]
-    fn parses_sink_volume_from_pactl_output() {
-        let real = "Volume: front-left: 26241 /  40% / -23.85 dB,   front-right: 26241 /  40% / -23.85 dB\n        balance 0.00\n";
-        assert_eq!(parse_pactl_volume(real), Some(40.0));
-        assert_eq!(parse_pactl_volume("Volume: mono: 65536 / 100% / 0.00 dB\n"), Some(100.0));
-        assert_eq!(parse_pactl_volume("Volume: front-left: 1 /   0% / -inf dB\n"), Some(0.0));
-        assert_eq!(parse_pactl_volume("Failure: No such entity\n"), None);
-        assert_eq!(parse_pactl_volume(""), None);
+    fn scene_volume_defaults_to_full_and_never_reads_the_sink() {
+        assert_eq!(SCENE_VOLUME_DEFAULT, 100.0);
+        // 滑杆显示用同一个常量（`None` 都不该出现：默认档有确定的值）
+        let shown = match Some(SCENE_VOLUME_DEFAULT) {
+            Some(v) => format!("{v:.0}%"),
+            None => "100%".to_string(),
+        };
+        assert_eq!(shown, "100%");
+        // 源码层面钉死：界面**不许**再去问系统音量（`get-sink-volume` 一个都不许有）。
+        // 只看测试模块**之前**的代码行（这条断言自己就写着这两个词）。
+        let src = include_str!("app.rs");
+        let code = src
+            .split("mod layout_tests {")
+            .next()
+            .unwrap_or("");
+        let mut hits = Vec::new();
+        for (i, line) in code.lines().enumerate() {
+            let t = line.trim_start();
+            if t.starts_with("//") {
+                continue;
+            }
+            if t.contains("get-sink-volume") || t.contains("set-sink-volume") {
+                hits.push(format!("{}: {t}", i + 1));
+            }
+        }
+        assert!(hits.is_empty(), "界面不该碰系统音量：{hits:?}");
     }
 
     /// 宣传图的等比缩放：塞进给定框内、不超框、不变形。

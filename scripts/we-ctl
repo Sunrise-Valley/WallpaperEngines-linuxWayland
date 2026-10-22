@@ -17,7 +17,7 @@
   ./we-ctl audio sinks                                   # 列出可用 sink（id / 名字 / 描述，标记默认）
   ./we-ctl audio sink=<id|名字|default|all>              # 音频分析跟哪一路输出（default 跟随系统）
   ./we-ctl set fps=30 scale=physical effects=all sleep=never sound=on fit=cover   # 改设置（见下）
-  ./we-ctl set time_scale=1.5 volume=40   # 播放速度（0.25~3.0×，只乘场景时间）/ 音乐音量（0~100%，默认 sink）
+  ./we-ctl set time_scale=1.5 volume=40   # 播放速度（0.25~3.0×，只乘场景时间）/ 场景音频音量（0~100%，只改内核自己那条流）
   ./we-ctl set-prop name=value [name=value ...] [--clear] # 用户属性覆盖（壁纸参数页同一张表）
   ./we-ctl --socket /run/user/1000/we-native.sock status     # 指定 socket
 
@@ -32,7 +32,8 @@ set 的可写字段（值域与内核一致，写错了这里就报错，不用�
   fit=cover|stretch|center|contain   取景模式：铺满裁边 / 拉伸铺满 / 1:1 居中 / 整张缩进留黑（中英文都认）
   color=亮度,对比度,饱和度,色相,色温,伽马   色彩调整六个浮点，单位值 = 1,1,1,0,0,1（如 1.1,1.1,1.2,0,0.1,1.0）
   time_scale=0.25..3.0               播放速度（**新能力**：乘的是场景时间；音频/鼠标不受影响）
-  volume=0..100                      音乐音量（调**默认 sink** 的 volume；回执/status 报回读的实际值）
+  volume=0..100                      场景音频音量（**只调内核自己那条播放流**：pactl set-sink-input-volume；
+                                     系统音量一动不动。默认 100%，换歌/换场景/重启内核后按它恢复）
 只写想改的字段即可（`set fps=24` 也行）；这些字段全是机制，怎么组合是界面（三档预设）的事。
 
 `set-prop` 是**壁纸自己的**用户属性（`project.json general.properties` 里的 bool/滑块/颜色/下拉/文本），

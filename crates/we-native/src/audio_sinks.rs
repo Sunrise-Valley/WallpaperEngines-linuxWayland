@@ -201,16 +201,35 @@ pub fn default_sink() -> Option<String> {
     parse_default_sink(&String::from_utf8_lossy(&out.stdout))
 }
 
-// ── 音乐音量（内核自己的输出 / 系统默认输出）───────────────────────────────────
-// 口径（用户 的要求）：内核**有音频输出**（壁纸自己的 sound 对象经
-// `pw-play`/`pw-cat` 播到默认输出）⇒ 调那一路的 sink volume；**没有**也照样调
-// 系统默认 sink —— 壁纸的音乐就在那条 sink 上。两种情形在这里是**同一条**命令：
-// `pactl set-sink-volume <默认 sink> <百分比>`（`@DEFAULT_SINK@` 也行，但先解析成
-// 节点名再调，回执里就能给出**具体是哪一路**，不糊成一句"成功了"）。
+// ── 场景音频音量（**只改内核自己那条播放流**）──────────────────────────────────
 //
-// 只动音量，不动静音位（`set-sink-mute` 不碰）—— "把音量拖到 0" 与"用户自己静音"是两件事。
+// 用户 2026-10-22：「为什么软件调整声音后，PC 音量变了？」—— 旧口径把音量发给
+// **默认 sink**（`pactl set-sink-volume`），那是**系统音量**：拖动壁纸滑杆会把整台机器
+// 的输出电平改掉（Chrome、播放器一起变小），退出/换壁纸后也不会自己回去。
+//
+// 正确口径：壁纸的配乐是内核**自己的子进程**（`pw-play`，自播管线里是 `pw-cat`）放出来的，
+// PulseAudio/PipeWire 里它是**一条独立的 sink-input**。要调的是**那一条流的音量**
+// （`pactl set-sink-input-volume`），跟 sink 本身的音量无关 ⇒ 系统音量一动不动。
+//
+// 怎么认出"我们那条流"：起播放器时打一条私有属性 `-P we.stream.id=<tag>`（tag 每次
+// spawn 唯一，见 `audio::Player::next_tag`）。**不能**只靠 PID：实测 `pw-play` 的流里
+// 根本没有 `application.process.id`（它是原生 PipeWire 客户端，不走 pulse 客户端库），
+// 只有 `application.name = "pw-play"` —— 多路壁纸音频就分不开。所以自己打标签，
+// 再按标签在 `pactl list sink-inputs` 里匹配。
+//
+// **绝不**再碰 `set-sink-volume` / `set-default-sink`：那是系统音量，不是我们的。
+// 静音位（`set-sink-input-mute`）同样不碰 —— "把音量拖到 0" 与"用户自己静音"是两件事。
 
-/// **纯函数**：从 `pactl get-sink-volume` 的输出里取第一个百分比。
+/// 我们打在播放流上的私有属性名（值 = 每次 spawn 唯一的 tag）。
+pub const STREAM_TAG_KEY: &str = "we.stream.id";
+
+/// 播放器进程的 `application.name`（`pactl list sink-inputs` 里一眼能看出是我们的流）。
+pub const APP_NAME: &str = "wallpaper-hub";
+
+/// 等流出现的重试次数（× 50 ms）：`pw-play` 建节点要几十毫秒，刚 spawn 完就查会落空。
+pub const STREAM_WAIT_TRIES: u32 = 20;
+
+/// **纯函数**：从 `pactl` 的 `Volume:` 行里取第一个百分比。
 ///
 /// 形态（实测本机 PipeWire 1.6.9）：
 /// `Volume: front-left: 26241 / 40% / -23.85 dB, front-right: 26241 / 40% / -23.85 dB`
@@ -245,47 +264,133 @@ pub fn parse_volume_pct(text: &str) -> Option<f32> {
     None
 }
 
-/// 读系统默认 sink 的音量（0..100）。拿不到 ⇒ `Err(人话原因)`。
-pub fn default_volume() -> Result<(String, f32), String> {
-    let sink = default_sink().unwrap_or_else(|| "@DEFAULT_SINK@".to_string());
-    let out = Command::new("pactl")
-        .args(["get-sink-volume", &sink])
-        .output()
-        .map_err(|e| format!("pactl 起不来：{e}"))?;
-    if !out.status.success() {
-        return Err(format!(
-            "pactl get-sink-volume {sink} 失败：{}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
-    }
-    let text = String::from_utf8_lossy(&out.stdout);
-    let v = parse_volume_pct(&text).ok_or_else(|| format!("读不懂 pactl 的音量输出：{}", text.trim()))?;
-    Ok((sink, v))
+/// `pactl list sink-inputs` 里的一条播放流（只留能认出"是不是我们的"那几项）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct StreamInput {
+    /// sink-input 索引：`pactl set-sink-input-volume <index>` 用它。**流一重建就变** ⇒ 每次现查。
+    pub index: u32,
+    /// `application.name`（我们的播放器统一叫 `wallpaper-hub`）
+    pub app: String,
+    /// `application.process.id`（`pw-play` 的流里**没有** ⇒ `None`；只当辅助判据）
+    pub pid: Option<u32>,
+    /// 我们打的 `we.stream.id`
+    pub tag: Option<String>,
+    /// 这条流**自己**的音量（0..100）；读不到 ⇒ `None`
+    pub volume: Option<f32>,
 }
 
-/// 设系统默认 sink 的音量（0..100，夹取）。成功 ⇒ `Ok((sink 名, 回读的实际百分比))`。
-///
-/// **回读**是刻意的：`pactl` 会按步长量化（本机 65536 级的 `40%` ⇒ 26214），回执里给
-/// 实际值，界面/验收看到的就是内核真正做出来的那个数。
-pub fn set_default_volume(percent: f32) -> Result<(String, f32), String> {
-    let pct = if percent.is_finite() {
-        percent.clamp(0.0, 100.0)
+/// **纯函数**：解析 `pactl list sink-inputs`。一块 = 一条流，`Sink Input #<n>` 起块。
+/// 空输出 / 残块 / 垃圾行一律跳过，绝不 panic（跟 `parse_sinks` 同一套脾气）。
+pub fn parse_stream_inputs(text: &str) -> Vec<StreamInput> {
+    let tag_prefix = format!("{STREAM_TAG_KEY} = ");
+    let mut out: Vec<StreamInput> = Vec::new();
+    let mut cur: Option<StreamInput> = None;
+    for line in text.lines() {
+        let t = line.trim_start();
+        if let Some(rest) = t.strip_prefix("Sink Input #") {
+            if let Some(s) = cur.take() {
+                out.push(s);
+            }
+            // 索引读不出来的残块直接丢（不 panic、也不猜一个 id 出去乱调）
+            cur = rest.trim().parse::<u32>().ok().map(|index| StreamInput {
+                index,
+                app: String::new(),
+                pid: None,
+                tag: None,
+                volume: None,
+            });
+            continue;
+        }
+        let Some(s) = cur.as_mut() else { continue };
+        if t.starts_with("Volume:") {
+            if s.volume.is_none() {
+                s.volume = parse_volume_pct(t);
+            }
+        } else if let Some(v) = t.strip_prefix("application.name = ") {
+            s.app = v.trim().trim_matches('"').to_string();
+        } else if let Some(v) = t.strip_prefix("application.process.id = ") {
+            s.pid = v.trim().trim_matches('"').parse::<u32>().ok();
+        } else if let Some(v) = t.strip_prefix(tag_prefix.as_str()) {
+            s.tag = Some(v.trim().trim_matches('"').to_string());
+        }
+    }
+    if let Some(s) = cur {
+        out.push(s);
+    }
+    out
+}
+
+/// 跑一次 `pactl list sink-inputs` 并解析。pactl 不在 / 报错 ⇒ 空表（调用方如实报"没找到"）。
+pub fn list_stream_inputs() -> Vec<StreamInput> {
+    match Command::new("pactl").args(["list", "sink-inputs"]).output() {
+        Ok(o) if o.status.success() => parse_stream_inputs(&String::from_utf8_lossy(&o.stdout)),
+        _ => Vec::new(),
+    }
+}
+
+/// 找**我们那条**流（按 tag）。找不到 ⇒ `None`（还没建好，或已经放完了）。
+pub fn find_stream(tag: &str) -> Option<StreamInput> {
+    list_stream_inputs()
+        .into_iter()
+        .find(|s| s.tag.as_deref() == Some(tag))
+}
+
+/// 读我们那条流现在的音量（0..100）。流不在 ⇒ `None`。
+pub fn read_stream_volume(tag: &str) -> Option<f32> {
+    find_stream(tag).and_then(|s| s.volume)
+}
+
+/// 音量夹取。**纯函数**：非法值如实报错（不悄悄变成 0 —— 0 是个合法音量）。
+pub fn clamp_volume(percent: f32) -> Result<f32, String> {
+    if percent.is_finite() {
+        Ok(percent.clamp(0.0, 100.0))
     } else {
-        return Err("音量必须是 0..100 的数字".into());
+        Err("音量必须是 0..100 的数字".into())
+    }
+}
+
+/// **只改内核自己那条流的音量**（0..100，夹取）。成功 ⇒ `Ok((sink-input 索引, 回读的实际百分比))`。
+///
+/// **回读**是刻意的：`pactl` 按步长量化（65536 级），日志/回执给的是内核真正做出来的那个数。
+///
+/// 流刚起时可能还不在 `pactl` 的表里（`pw-play` 建节点要几十毫秒）⇒ 有界重试
+/// （`STREAM_WAIT_TRIES` × 50 ms ≈ 1 s）。等不到就**如实报错返回**（不静默当成功）：
+/// 调用方是音频音量线程，不卡渲染、不卡控制面。
+pub fn set_stream_volume(tag: &str, percent: f32) -> Result<(u32, f32), String> {
+    let pct = clamp_volume(percent)?;
+    let mut found = None;
+    for attempt in 0..STREAM_WAIT_TRIES {
+        if let Some(s) = find_stream(tag) {
+            found = Some(s);
+            break;
+        }
+        if attempt + 1 < STREAM_WAIT_TRIES {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+    let Some(s) = found else {
+        return Err(format!(
+            "找不到我们的播放流（{STREAM_TAG_KEY}={tag}）：壁纸没在放音频，或 pactl 不在"
+        ));
     };
-    let sink = default_sink().unwrap_or_else(|| "@DEFAULT_SINK@".to_string());
     let out = Command::new("pactl")
-        .args(["set-sink-volume", &sink, &format!("{pct:.0}%")])
+        .args([
+            "set-sink-input-volume",
+            &s.index.to_string(),
+            &format!("{pct:.0}%"),
+        ])
         .output()
         .map_err(|e| format!("pactl 起不来：{e}"))?;
     if !out.status.success() {
         return Err(format!(
-            "pactl set-sink-volume {sink} {pct:.0}% 失败：{}",
+            "pactl set-sink-input-volume {} {pct:.0}% 失败：{}",
+            s.index,
             String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
-    let (sink, actual) = default_volume()?;
-    Ok((sink, actual))
+    // 回读：读不到就报请求值（已经设成功了，只是表刷得慢）
+    let actual = read_stream_volume(tag).unwrap_or(pct);
+    Ok((s.index, actual))
 }
 
 /// `pactl` 的百分比是**每声道**的；这里给单测用的样本文本。
@@ -592,15 +697,88 @@ Sink #700\n\
         assert_eq!(parse_volume_pct(""), None);
     }
 
+    /// 实测本机 `pactl list sink-inputs` 的形态（2026-10-22，pipewire-pulse 15.0.0 / PipeWire 1.6.9）：
+    /// Chrome 那条有 `application.process.id`，**我们这条 `pw-play` 没有** —— 这正是"必须自己打
+    /// `we.stream.id` 标签"的原因。解析要能按标签认出我们那条，并顺手读到它自己的音量。
+    #[test]
+    fn parses_our_stream_input_by_tag() {
+        let real = "\
+Sink Input #1990
+\tDriver: PipeWire
+\tSink: 56
+\tVolume: front-left: 65536 / 100% / 0.00 dB,   front-right: 65536 / 100% / 0.00 dB
+\t        balance 0.00
+\tProperties:
+\t\tapplication.name = \"Google Chrome\"
+\t\tapplication.process.id = \"337269\"
+
+Sink Input #2153
+\tDriver: PipeWire
+\tVolume: mono: 13107 /  20% / -41.94 dB
+\t        balance 0.00
+\tProperties:
+\t\tapplication.name = \"wallpaper-hub\"
+\t\twe.stream.id = \"we-0-7\"
+\t\tmedia.name = \"tone.wav\"
+\t\tmodule-stream-restore.id = \"sink-input-by-media-role:music\"
+";
+        let v = parse_stream_inputs(real);
+        assert_eq!(v.len(), 2, "两块 = 两条流：{v:?}");
+        // Chrome：没有我们的标签，有 pid
+        assert_eq!(v[0].index, 1990);
+        assert_eq!(v[0].app, "Google Chrome");
+        assert_eq!(v[0].pid, Some(337269));
+        assert_eq!(v[0].tag, None, "别人的流不能带上我们的标签");
+        assert_eq!(v[0].volume, Some(100.0));
+        // 我们那条：有标签、**没有** pid（pw-play 原生客户端）
+        assert_eq!(v[1].index, 2153);
+        assert_eq!(v[1].app, "wallpaper-hub");
+        assert_eq!(v[1].pid, None);
+        assert_eq!(v[1].tag.as_deref(), Some("we-0-7"));
+        assert_eq!(v[1].volume, Some(20.0), "读的是这条流自己的音量");
+        // 按标签查得到的只有我们那条
+        let ours: Vec<_> = v.iter().filter(|s| s.tag.as_deref() == Some("we-0-7")).collect();
+        assert_eq!(ours.len(), 1);
+        // 空/垃圾输入 ⇒ 空表，不 panic
+        assert!(parse_stream_inputs("").is_empty());
+        assert!(parse_stream_inputs("Failure: No such entity\n").is_empty());
+        // 索引读不出来的残块整块丢掉（不能猜一个 id 出去乱调）
+        assert!(parse_stream_inputs("Sink Input #\n\tVolume: mono: 1 / 1% / -60 dB\n").is_empty());
+    }
+
     /// 音量夹取：0..100，非法值如实报错（不悄悄变成 0）。
     #[test]
     fn volume_range_is_clamped_and_nan_is_rejected() {
-        // 夹取只影响发给 pactl 的字符串；这里测纯逻辑（不真跑 pactl：会改本机音量）
-        let clamp = |v: f32| v.clamp(0.0, 100.0);
-        assert_eq!(clamp(-5.0), 0.0);
-        assert_eq!(clamp(120.0), 100.0);
-        assert_eq!(clamp(40.0), 40.0);
-        assert!(set_default_volume(f32::NAN).is_err(), "NaN 必须报错");
+        assert_eq!(clamp_volume(-5.0), Ok(0.0));
+        assert_eq!(clamp_volume(120.0), Ok(100.0));
+        assert_eq!(clamp_volume(40.0), Ok(40.0));
+        assert!(clamp_volume(f32::NAN).is_err(), "NaN 必须报错");
+        // 夹取在**跑 pactl 之前**就做完 ⇒ 非法值一个子进程都不起（这里 tag 是假的也不会卡 1 秒）
+        assert!(set_stream_volume("no-such-tag", f32::NAN).is_err());
+    }
+
+    /// 音量只打 **sink-input**，绝不打 sink 本身（用户 2026-10-22 的 bug：改壁纸音量把 PC 音量也改了）。
+    #[test]
+    fn volume_never_targets_the_sink_itself() {
+        // 只看 `#[cfg(test)]` 之前的**代码行**（注释里提到这些命令名是解释"为什么不能用"）
+        let src = include_str!("audio_sinks.rs");
+        let code = src.split("#[cfg(test)]").next().unwrap_or("");
+        let mut hit = Vec::new();
+        for line in code.lines() {
+            let t = line.trim_start();
+            if t.starts_with("//") {
+                continue;
+            }
+            for bad in ["set-sink-volume", "set-default-sink"] {
+                if t.contains(bad) {
+                    hit.push(format!("{bad} ⇒ {t}"));
+                }
+            }
+        }
+        assert!(
+            hit.is_empty(),
+            "这些会改**系统音量**，不是我们这条流：{hit:?}"
+        );
     }
 
     #[test]

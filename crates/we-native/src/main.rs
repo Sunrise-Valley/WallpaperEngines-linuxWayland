@@ -386,7 +386,8 @@ mod serve {
             /// **播放速度**（场景时间倍率）：0.25 ~ 3.0（渲染器再夹一次）
             /// `we_scene_render::set_time_scale`）。只乘场景时间 —— 音频/鼠标不受影响。
             time_scale: Option<f32>,
-            /// **音乐音量**：0 ~ 100（百分比），调默认 sink 的 volume（见 `audio_sinks`）。
+            /// **场景音频音量**：0 ~ 100（百分比）。只调**内核自己那条播放流**的音量
+            /// （per-stream，见 `audio_sinks`），系统 sink 的音量一动不动。
             volume: Option<f32>,
         },
         /// runtime 改用户属性覆盖（壁纸参数页改 bool/slider/color/combo/text 走这条）。
@@ -912,7 +913,7 @@ mod serve {
                 }
                 other => panic!("set 解析错了：{other:?}"),
             }
-            // 两个新旋钮（播放速度 / 音乐音量）——**数字**字段，不是字符串
+            // 两个新旋钮（播放速度 / 场景音频音量）——**数字**字段，不是字符串
             match parse("{\"cmd\":\"set\",\"time_scale\":1.25,\"volume\":47.5}") {
                 Cmd::Set { time_scale, volume, .. } => {
                     assert_eq!(time_scale, Some(1.25));
@@ -1534,10 +1535,11 @@ fn main() {
         render_scale: std::env::var("WE_RENDER_SCALE").unwrap_or_else(|_| "physical".to_string()),
         sound_on: std::env::var("WE_SOUND").map(|v| v != "0").unwrap_or(true),
         time_scale: we_scene_render::time_scale(),
-        // 启动读一次默认 sink 的实际音量（一次 pactl，几毫秒）⇒ status 一开始就是诚实的
-        sink_volume: audio_sinks::default_volume().ok().map(|(_, v)| v),
-        sink_name: audio_sinks::default_sink(),
-        sink_volume_note: None,
+        // 场景音频音量：默认 100%。**不读**系统 sink 的音量 —— 那是别的东西，
+        // 读进来只会让滑杆一上手就把壁纸音量拽到系统电平上（用户 2026-10-22 的 bug 的另一半）。
+        scene_volume: 100.0,
+        volume_stream: None,
+        volume_note: None,
         effects_on: std::env::var("WE_EFFECTS").map(|v| v != "none").unwrap_or(true),
         // 鼠标输入：seat 已在上面的全局绑定处拿到（`WE_MOUSE_POINTER=0` 时为 None）
         seat,
@@ -2210,13 +2212,14 @@ struct Wall {
     /// **播放速度**（场景时间倍率，默认 1.0）。真正生效的是渲染器那个全局
     /// （`we_scene_render::time_scale`）；这里存一份**实际生效值**给 status/回执。
     time_scale: f32,
-    /// **音乐音量**（0..100，默认 sink 的 volume）。`None` = 启动时没读出来；
-    /// 由 `set volume=` 回读填上，status 里 -1 表示未知（不假装 0）。
-    sink_volume: Option<f32>,
-    /// 最近一次音量操作生效的 sink 节点名（status/日志用，明说打的是哪一路）
-    sink_name: Option<String>,
-    /// 最近一次音量操作失败的原因（人话；成功后保留上一次的值不动）
-    sink_volume_note: Option<String>,
+    /// **场景音频音量**（0..100）。只作用于**内核自己那条播放流**（per-stream），
+    /// 不是系统音量。默认 100%；界面滑杆拖动时逐条发来，内核记住这个值 ——
+    /// 换歌/换场景/从暂停恢复时按它重新贴到新流上（音轨换了流就换了）。
+    scene_volume: f32,
+    /// 最近一次音量落地的**那条流**（`#<sink-input 索引>`；status/日志用）
+    volume_stream: Option<String>,
+    /// 最近一次音量操作失败的原因（人话；成功后清空）
+    volume_note: Option<String>,
     /// 特效链开不开（省电档的最大杠杆）
     effects_on: bool,
 
@@ -2964,10 +2967,14 @@ impl Wall {
             serve::jesc(&self.sleep_mode),
             serve::jesc(&self.render_scale),
             if self.effects_on { "all" } else { "none" },
-            // 播放速度 / 音乐音量（新增的两个调节项）：status 里**直接可见**
+            // 播放速度 / 场景音频音量（两个调节项）：status 里**直接可见**
             self.time_scale,
-            self.sink_volume.unwrap_or(-1.0),
-            serve::jesc(self.sink_name.as_deref().unwrap_or("")),
+            // 音量：有音轨就报**音频线程实际在用的**那个值（不是界面最后一次点的那一下）
+            self.audio
+                .as_ref()
+                .map(|a| a.volume_pct())
+                .unwrap_or(self.scene_volume),
+            serve::jesc(self.volume_stream.as_deref().unwrap_or("")),
             self.polls,
             self.ticks,
             self.wl_wakes,
@@ -3205,19 +3212,37 @@ impl Wall {
                     println!("[控制面] time_scale = {eff:.3}×（只乘场景时间：g_Time/粒子/网格动画；音频与鼠标不受影响）");
                 }
                 if let Some(v) = volume {
-                    // **音乐音量**：调默认 sink 的 volume（壁纸自己的 sound 就播在它上面）。
-                    // 同步调用 pactl（几毫秒），回读实际值 —— 回执与 status 都报**实际**百分比。
-                    match audio_sinks::set_default_volume(v) {
-                        Ok((sink, actual)) => {
-                            self.sink_volume = Some(actual);
-                            self.sink_name = Some(sink.clone());
+                    // **场景音频音量**：只调**内核自己那条播放流**（per-stream）。
+                    // 系统 sink 的音量一个字都不动（用户 2026-10-22 的 bug：旧实现调的是
+                    // `set-sink-volume`，于是拖壁纸滑杆把整台机器的音量也改了）。
+                    // 真正的 pactl 调用在音频音量线程上，这里只是记住值 + 排队（不卡控制面）。
+                    self.scene_volume = audio_sinks::clamp_volume(v).unwrap_or(self.scene_volume);
+                    match self.audio.as_mut() {
+                        Some(a) => match a.set_volume(self.scene_volume) {
+                            Ok(()) => {
+                                self.volume_note = None;
+                                self.volume_stream = a.live_stream_label();
+                                println!(
+                                    "[控制面] 场景音频 {}% ⇒ 按到自己那条播放流 {} 上（系统音量不动）",
+                                    self.scene_volume,
+                                    self.volume_stream.as_deref().unwrap_or("(还没建好)")
+                                );
+                            }
+                            Err(e) => {
+                                println!("[控制面] 场景音频 {v:.1}% 失败：{e}");
+                                self.volume_stream = None;
+                                self.volume_note = Some(e);
+                            }
+                        },
+                        None => {
+                            // 当前场景没有音轨（或还没挂上）：记住值，等音轨挂上时按它生效。
+                            // 这**不算错**：静音壁纸本来就没有可调的东西。
                             println!(
-                                "[控制面] volume 请求 {v:.1}% ⇒ sink {sink} 实际 {actual:.0}%（pactl 量化后回读）"
+                                "[控制面] 场景音频 {}% 已记住（当前壁纸没有音轨，挂上后生效）",
+                                self.scene_volume
                             );
-                        }
-                        Err(e) => {
-                            println!("[控制面] volume {v:.1}% 失败：{e}");
-                            self.sink_volume_note = Some(e);
+                            self.volume_note =
+                                Some("当前壁纸没有音轨：音量已记住，挂上带音频的壁纸后生效".into());
                         }
                     }
                 }
@@ -3254,8 +3279,8 @@ impl Wall {
                         if self.effects_on { "all" } else { "none" },
                         if self.sound_on { "on" } else { "off" },
                         self.time_scale,
-                        // 1 = 还没读过（界面据此显示"未知"而不是假的 0）
-                        self.sink_volume.unwrap_or(-1.0)
+                        // 场景音频音量（0..100；-1 不再表示"未知" —— 它有确定的默认值 100）
+                        self.scene_volume
                     ),
                     false,
                 )
@@ -4200,8 +4225,14 @@ impl Wall {
                         }
                         // 立刻按当前状态（睡/醒）决定播不播
                         let want = self.is_active();
+                        let vol = self.scene_volume;
                         if let Some(a) = self.audio.as_mut() {
                             a.set_playing(want);
+                            // 新场景的音量按**内核记住的值**来（不是系统 sink 的音量）：
+                            // 换壁纸不该把「场景音频」滑杆的位置丢掉
+                            if let Err(e) = a.set_volume(vol) {
+                                println!("[音频] 场景音频 {vol}% 没落地：{e}");
+                            }
                         }
                     }
                 }
