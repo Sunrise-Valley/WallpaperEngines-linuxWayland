@@ -98,7 +98,8 @@ install -m 0644 crates/wallpaper-hub/resources/icons/hicolor/scalable/apps/icon.
   "$STAGE/usr/share/icons/hicolor/scalable/apps/io.github.wallpaperhub.WallpaperHub.svg"
 
 # Docs required by policy (§12.5): copyright + upstream docs.
-install -m 0644 README.md       "$STAGE/usr/share/doc/$PKG/README.md"
+install -m 0644 README.md       "$STAGE/usr/share/doc/$PKG/README.md"      # Chinese (default)
+install -m 0644 README.en.md    "$STAGE/usr/share/doc/$PKG/README.en.md"   # English
 install -m 0644 ARCHITECTURE.md "$STAGE/usr/share/doc/$PKG/ARCHITECTURE.md"
 install -m 0644 CHANGELOG.md    "$STAGE/usr/share/doc/$PKG/CHANGELOG.md"
 install -m 0644 packaging/copyright "$STAGE/usr/share/doc/$PKG/copyright"
