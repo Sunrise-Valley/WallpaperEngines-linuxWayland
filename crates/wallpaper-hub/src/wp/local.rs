@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: MIT
 //
-//! 本地壁纸库：**不经过 waywallen daemon**，直接扫 Steam 工坊目录建列表。
+//! 本地壁纸库：**不经过任何 daemon**，直接扫磁盘上的壁纸目录建列表。
 //!
-//! 为什么需要它：daemon 是 waywallen 的一部分，重启后不会自动起来（我们是
-//! `systemd-run` 拉的瞬态服务），而界面里那份列表**只有 daemon 一个来源**
-//! ⇒ daemon 一停，界面就"未连接 + 列表空"。自研内核（we-native）本来就自己
+//! 为什么需要它：界面里那份列表不能依赖别人 —— 自研内核（we-native）本来就自己
 //! 读 `scene.pkg`、自己渲染，**列表也没必要再问别人**。
+//!
+//! 扫哪些目录由 [`crate::wp::library`] 决定：**用户自定义根目录**（默认 `~/Templates`）
+//! 为主，Steam 工坊目录（`…/workshop/content/431960`）只是**可选的**额外扫描源
+//! —— 没有 Steam 的机器上就是少一处来源，不是错误。
 //!
 //! 数据来源全是磁盘上现成的东西：
 //!
@@ -14,32 +16,45 @@
 //!
 //! * `description` 里作者常写的 `tags:…` 一行（工坊标签，daemon 那边是从数据库取）
 //!
-//! * 目录名 —— 工坊 id（`external_id`，内核据此定位目录）
+//! * 目录名 —— 壁纸 id（`external_id`，内核据此定位目录）
 //!
 //! 产出的结构与 daemon 回的 `WallpaperEntry` **完全一致** ⇒ 界面其余部分一行不用改。
 
+use crate::wp::library;
 use crate::wp::proto;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-/// 工坊内容目录。`WE_WORKSHOP_DIR` 可覆盖（测试/多库共存时用）。
-pub fn workshop_dir() -> PathBuf {
-    if let Ok(p) = std::env::var("WE_WORKSHOP_DIR")
-        && !p.is_empty()
-    {
-        return PathBuf::from(p);
+/// 扫**全部根目录**：用户自定义目录（默认 `~/Templates`）+ 可选的 Steam 工坊目录。
+/// `configured` = 界面配置里的 `library_dirs`（空表 ⇒ 用默认根目录）。
+///
+/// 同一个 id 在多个根目录都出现时**先出现的胜出**（用户目录排在 Steam 前面），
+/// 这样"把工坊目录搬进 ~/Templates"这种迁移不会出现重复卡片。
+pub fn scan_with(configured: &[String]) -> Vec<proto::WallpaperEntry> {
+    let roots = library::roots(configured);
+    let mut out: Vec<proto::WallpaperEntry> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = Default::default();
+    for root in &roots {
+        for e in scan_dir(root) {
+            if seen.insert(e.id.clone()) {
+                out.push(e);
+            }
+        }
     }
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    Path::new(&home).join(".local/share/Steam/steamapps/workshop/content/431960")
+    out.sort_by_key(|e| e.name.to_lowercase());
+    out
 }
 
-/// 扫默认工坊目录。
-pub fn scan() -> Vec<proto::WallpaperEntry> {
-    scan_dir(&workshop_dir())
-}
-
-/// 扫一个目录里的所有子目录。目录不存在 ⇒ 空表（**不报错**：全新机器/没装 Steam 是正常状态）。
+/// 扫一个目录里的所有子目录。目录不存在 ⇒ 空表（**不报错**：全新机器是正常状态）。
+/// ❗另外：目录**本身**就是一个工程（根下直接有 `project.json`）时，把它当一条壁纸
+/// —— 用户完全可能直接把一条 scene 目录丢进 `~/Templates/<任意名>/`。
 /// 按显示名排序，保证每次打开的次序稳定。
 pub fn scan_dir(dir: &Path) -> Vec<proto::WallpaperEntry> {
+    if !dir.is_dir() {
+        return Vec::new();
+    }
+    if dir.join("project.json").is_file() {
+        return entry_from_dir(dir).into_iter().collect();
+    }
     let Ok(rd) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
@@ -193,6 +208,7 @@ fn dir_size(dir: &Path) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     fn tmpdir(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("wh-local-test-{tag}-{}", std::process::id()));
@@ -201,11 +217,81 @@ mod tests {
         d
     }
 
+    /// 造一条最小可识别的壁纸目录。
+    fn make(root: &Path, name: &str, title: &str) {
+        let d = root.join(name);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(
+            d.join("project.json"),
+            format!(r#"{{"title":"{title}","type":"scene"}}"#),
+        )
+        .unwrap();
+        std::fs::write(d.join("scene.pkg"), b"PKGV").unwrap();
+    }
+
     #[test]
     fn missing_dir_is_empty_not_error() {
         // 全新机器没装 Steam ⇒ 空表，不能 panic、也不能报错
         let out = scan_dir(Path::new("/nonexistent/workshop/431960"));
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn root_that_is_itself_a_project_yields_one_entry() {
+        // 用户把一整条 scene 目录直接放进 `~/Templates/我的壁纸/` 也要能扫到
+        let root = tmpdir("selfproj");
+        std::fs::write(
+            root.join("project.json"),
+            r#"{"title":"my own wall","type":"scene"}"#,
+        )
+        .unwrap();
+        std::fs::write(root.join("scene.pkg"), b"PKGV").unwrap();
+        let list = scan_dir(&root);
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].name, "my own wall");
+        assert_eq!(list[0].id, root.file_name().unwrap().to_string_lossy());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn arbitrary_dir_name_still_uses_project_title_and_dir_name_as_id() {
+        // `<root>/<任意名>/`（不是工坊 id）⇒ 名字取 title，id 取目录名（内核按它找目录）
+        let root = tmpdir("anyname");
+        make(&root, "夏日影 (麻匪)", "夏日影");
+        let list = scan_dir(&root);
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].name, "夏日影");
+        assert_eq!(list[0].id, "夏日影 (麻匪)");
+        assert_eq!(list[0].external_id, "夏日影 (麻匪)");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn scan_with_merges_roots_and_dedupes_by_id() {
+        // 两个根目录各有一条；同一个 id 在两处都有 ⇒ 只留第一份（用户目录优先）
+        let a = tmpdir("multi-a");
+        let b = tmpdir("multi-b");
+        make(&a, "111", "from A");
+        make(&a, "222", "dup in A");
+        make(&b, "222", "dup in B");
+        make(&b, "333", "from B");
+        // 用 env 把根目录钉成这两个（同一进程内只有这一个测试改 env）
+        unsafe { std::env::set_var(library::ENV_DIRS, format!("{}:{}", a.display(), b.display())) };
+        let list = scan_with(&[]);
+        unsafe { std::env::remove_var(library::ENV_DIRS) };
+        // 只看本测试造的那三条（真机上 Steam 目录也可能存在，那是额外的合法来源）
+        let got: Vec<(&str, &str)> = list
+            .iter()
+            .filter(|e| ["111", "222", "333"].contains(&e.id.as_str()))
+            .map(|e| (e.id.as_str(), e.name.as_str()))
+            .collect();
+        assert_eq!(got, vec![("222", "dup in A"), ("111", "from A"), ("333", "from B")]);
+        assert!(
+            list.iter().find(|e| e.id == "222").unwrap().resource.starts_with(&*a.to_string_lossy()),
+            "重复 id 取第一个根目录那份"
+        );
+        let _ = std::fs::remove_dir_all(&a);
+        let _ = std::fs::remove_dir_all(&b);
     }
 
     #[test]

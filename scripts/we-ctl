@@ -7,7 +7,8 @@
   ./we-ctl status
   ./we-ctl apply-image /path/to.jpg
   ./we-ctl apply-video /path/to.mp4
-  ./we-ctl apply-scene /path/to/workshop/431960/<id>     # WE scene 壁纸目录（自研渲染器）
+  ./we-ctl apply-scene ~/Templates/<id>                  # WE scene 壁纸目录（自研渲染器）；只给 <id> 也行
+                                                        #   （内核按 id 在本地库根目录里找：默认 ~/Templates）
   ./we-ctl pause | resume | quit
   ./we-ctl mouse <x,y>                                   # 鼠标位置（归一化 0..1，y 向下；与内核同一口径）
   ./we-ctl dump <前缀> [张数=10] [--output]              # 帧转储：把接下来 N 帧的上屏画面存成 PNG（内核侧渲染；上限 10 帧，编码在内核 worker 线程）

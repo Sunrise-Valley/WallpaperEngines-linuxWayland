@@ -480,16 +480,13 @@ pub fn unsupported_reason(wp_type: &str) -> Option<String> {
 }
 
 /// 这条壁纸在磁盘上的内容目录。
-/// 工坊条目用 `external_id` 定位；否则退回 daemon 给的 `resource`（可能是目录或包文件）。
+/// 用 `external_id`（= 目录名）在**全部本地库根目录**里找（`~/Templates` 之类的用户
+/// 目录优先，Steam 工坊目录只是可选的额外来源）；否则退回 daemon 给的 `resource`。
 pub fn entry_dir(entry: &proto::WallpaperEntry) -> Option<PathBuf> {
-    if !entry.external_id.is_empty() {
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-        let d = Path::new(&home)
-            .join(".local/share/Steam/steamapps/workshop/content/431960")
-            .join(&entry.external_id);
-        if d.is_dir() {
-            return Some(d);
-        }
+    if !entry.external_id.is_empty()
+        && let Some(d) = crate::wp::library::resolve_id(&entry.external_id)
+    {
+        return Some(d);
     }
     if entry.resource.is_empty() {
         return None;

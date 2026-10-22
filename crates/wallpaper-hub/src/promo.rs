@@ -422,8 +422,8 @@ mod real_data_tests {
     /// 宣传图能被抽出来、且都是外链。
     #[test]
     fn real_workshop_project_yields_remote_promo_when_present() {
-        let dir = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()))
-            .join(".local/share/Steam/steamapps/workshop/content/431960/2887537617");
+        // 本地库根目录里按 id 找（默认 `~/Templates`）
+        let dir = crate::wp::library::resolve_id("2887537617").unwrap_or_default();
         let Ok(js) = std::fs::read_to_string(dir.join("project.json")) else {
             eprintln!("跳过：本机没有 2887537617 的 project.json");
             return;

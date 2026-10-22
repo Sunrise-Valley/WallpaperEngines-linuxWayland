@@ -61,6 +61,12 @@ pub struct Config {
     /// `--no-auto-apply` / `WPHUB_NO_AUTO_APPLY=1`（只影响本次会话），
     /// 或把这一项写成 `false`（持久）。判据是纯函数 `app::decide_auto_apply`。
     pub auto_apply_last: bool,
+    /// **本地壁纸库根目录**（一行一个路径；`~` 会展开）。空表 = 用默认值 `~/Templates`。
+    /// 这些目录下每个子目录各算一条壁纸（`<root>/<id>/` 或 `<root>/<任意名>/`）。
+    /// 有效的根目录还会**连同可选的 Steam 工坊目录**一起写进
+    /// `~/.local/share/wallpaper-hub/library_dirs`，常驻内核读那一份 ⇒ 这里改完，
+    /// 内核不用重启也能按 id 找到新位置。环境变量 `WPHUB_LIBRARY_DIRS` 会整体覆盖本项。
+    pub library_dirs: Vec<String>,
 }
 
 /// 手写 `Default`（**不能**再 derive）：`show_promo` 的默认值要是 `true`
@@ -82,6 +88,8 @@ impl Default for Config {
             show_promo: true,
             // 默认"不乱换"：允许在内核**空闲**时补上"上次应用"，但绝不换掉内核正在播的那条。
             auto_apply_last: true,
+            // 空表 = 默认根目录 `~/Templates`（见 `wp::library::default_roots`）。
+            library_dirs: Vec::new(),
         }
     }
 }

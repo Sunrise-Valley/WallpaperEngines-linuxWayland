@@ -12,12 +12,62 @@ call into Valve's code at runtime. The scene format was reconstructed from the f
 themselves and cross-checked against public reimplementations; the renderer is written
 from scratch in Rust on top of `glow` + EGL/GLES.
 
+**The engine does not depend on the Steam client.** It does not log in, does not
+subscribe, does not download anything, and does not need Steam installed at all. It reads
+scene wallpapers from plain directories on your disk — see
+[Where wallpapers come from](#where-wallpapers-come-from).
+
 ---
+
+## Where wallpapers come from
+
+A scene wallpaper is just a directory: `project.json` (the WE project file) plus
+`scene.pkg` (the packed scene) and a preview image. The engine scans **local library
+directories** for those directories and lists whatever it finds.
+
+| Source | Default | Notes |
+|---|---|---|
+| **Local library roots** | `~/Templates` | the primary source; each subdirectory is one wallpaper |
+| Steam workshop content | `~/.local/share/Steam/steamapps/workshop/content/431960` | **optional**; scanned only if it exists |
+
+Layout inside a library root — all three shapes work:
+
+```
+~/Templates/
+├── 3704273480/         # workshop id as the directory name (what Steam used)
+│   ├── project.json
+│   ├── scene.pkg
+│   └── preview.gif
+├── my-favourite-scene/ # any name; the display name comes from project.json "title"
+│   └── …
+└── one-more/           # a root that IS a single project also works
+    ├── project.json
+    └── scene.pkg
+```
+
+Configure the roots (highest precedence first):
+
+1. environment variable `WPHUB_LIBRARY_DIRS` — colon-separated, `~` is expanded:
+   `WPHUB_LIBRARY_DIRS=~/Templates:/mnt/walls`
+2. the app's `library_dirs` list (COSMIC settings → **壁纸库 / Library**)
+3. `~/.local/share/wallpaper-hub/library_dirs`, one path per line — the UI writes this
+   file, the resident kernel reads it, so changing the roots does not require a kernel
+   restart
+4. nothing configured ⇒ `~/Templates`
+
+The kernel accepts either an absolute path in `apply` or just a wallpaper id; for an id
+it looks through the same roots, so a wallpaper that moved from the Steam directory to
+`~/Templates` keeps working.
+
+Directories are opened **read-only**. Nothing is written into a Steam library, and no
+Steam account, token or SteamID is ever read or stored.
+
 
 ## What it does
 
-* **Plays workshop `scene` wallpapers** — reads `scene.pkg` (PKGV container), the `.tex`
-  texture containers inside it, and `scene.json`, then renders the scene graph.
+* **Plays `scene` wallpapers** — reads `scene.pkg` (PKGV container), the `.tex` texture
+  containers inside it, and `scene.json`, then renders the scene graph. Workshop
+  downloads and hand-copied directories are treated identically.
 * **Real wallpaper layer on Wayland** — one `zwlr_layer_shell_v1` surface per output on
   the *background* layer, sized to the output's physical pixels, so windows, panels and
   the compositor's own effects composite on top of it as usual.
@@ -110,7 +160,7 @@ Data flow for one wallpaper:
 
 ```
 UI: user clicks "apply"
-  → {"cmd":"apply","kind":"scene","path":"<workshop dir>"}      (unix socket)
+  → {"cmd":"apply","kind":"scene","path":"<library dir>"}       (unix socket)
 KERNEL: resolves the scene, drops any previous renderer state
   → we_scene::pkg::open()        PKGV → entries
   → we_scene::scene::parse()     scene.json → objects/effects
@@ -160,7 +210,7 @@ Run it:
 # the kernel's control socket lives in $XDG_RUNTIME_DIR
 crates/we-native/target/release/we-native --serve "$XDG_RUNTIME_DIR/we-native.sock" &
 scripts/we-ctl status
-scripts/we-ctl apply-scene ~/.local/share/Steam/steamapps/workshop/content/431960/<id>
+scripts/we-ctl apply-scene ~/Templates/<id>       # or just the id: plain <id> works too
 
 # or use the GUI, which speaks the same socket
 crates/wallpaper-hub/target/release/wallpaper-hub
@@ -248,8 +298,10 @@ sudo apt remove wallpaper-hub
 * **Rendering cost grows with the scene.** A full-screen scene with many effect passes is
   GPU-heavy; the adaptive frame-rate logic exists for that reason.
 * **Wayland only** (COSMIC is the tested compositor); X11 is not implemented.
-* **No Steam integration.** The UI reads the local workshop directory; it never logs in,
-  subscribes, downloads, or modifies your Steam library.
+* **No Steam integration, and none needed.** The UI scans local library directories
+  (`~/Templates` by default) and, if it happens to exist, the Steam workshop content
+  directory. It never logs in, subscribes, downloads, or modifies a Steam library, and a
+  machine without the Steam client is a fully supported setup.
 
 ## Environment variables
 
@@ -276,6 +328,8 @@ These are features, not debug leftovers — grouped by what they change.
 | `WE_PROP_<NAME>=<value>` | pre-set a user property |
 | `WE_POINTER`, `WE_POINTER_GLOBAL`, `WE_MOUSE_OVERRIDE_MS` | pointer input source |
 | `WE_RESTORE_APP_STATE` | restore per-scene props/fps after a kernel restart |
+| `WPHUB_LIBRARY_DIRS` | colon-separated local wallpaper roots (default `~/Templates`); overrides the config list and the state file |
+| `WPHUB_NO_AUTO_APPLY` | do not re-apply the last wallpaper when the kernel is idle |
 | `WE_WATCHDOG*`, `WE_FADE*` | stall watchdog and fade behaviour |
 
 **Diagnostics (off by default, no cost on the hot path)** — `WE_MOUSE_DEBUG`,
@@ -290,9 +344,11 @@ effect only when passed explicitly.
 * **This repository contains no Steam content and no wallpaper assets.** No `scene.pkg`,
   no `.tex`, no ripped shaders, no workshop files, no screenshots of other people's
   wallpapers.
-* **You need your own copy of Wallpaper Engine** (and the workshop items you want to
-  display) for this to be useful. The engine only reads files you already own, from the
-  Steam library on your own machine.
+* **You bring the wallpapers.** The engine plays scene directories that already exist on
+  your disk — it does not obtain, download or bundle them, and it never talks to Steam.
+  Which directories those are is up to you (see
+  [Where wallpapers come from](#where-wallpapers-come-from)); Steam is one optional source
+  among several, not a requirement.
 * **No Wallpaper Engine code is used or included.** The format knowledge here was
   derived from the data files and from public reimplementation projects; no Valve or
   Wallpaper Engine binaries, shaders or source are redistributed. Wallpaper Engine is a
@@ -329,7 +385,12 @@ GPU 帧率自适应；单帧离线渲染器让「同参数同像素」可复现�
 `wl_surface`）→ 渲染器（场景解析 / 逐趟管线 / GL）。目录结构见上表。
 
 当前限制：仅验证过 17 个场景；部分特效与遮罩语义仍在与原引擎对齐；性能吃 GPU；只做了
-Wayland（COSMIC 上测的）；没有任何 Steam 登录 / 订阅 / 下载行为。
+Wayland（COSMIC 上测的）；没有任何 Steam 登录 / 订阅 / 下载行为（也不需要 Steam）。
 
-法律：仓库**不含任何 Steam 内容或壁纸资源**，你需要自己拥有 Wallpaper Engine；未使用其
-代码；`waywallen` 的 proto 数据模型（MIT）已注明来源。项目代码 MIT。
+壁纸从哪来：引擎**不依赖 Steam 客户端**（不登录、不订阅、不下载、不需要装 Steam），
+它扫的是**本地壁纸库根目录**（默认 `~/Templates`，每种子目录 = 一条壁纸；可用
+`WPHUB_LIBRARY_DIRS` 或界面里的目录列表改）。本机的 Steam 工坊目录（`…/431960`）
+若存在只是**额外**扫一处，不存在也不报错。内核 `apply` 既收绝对路径也收壁纸 id。
+
+法律：仓库**不含任何 Steam 内容或壁纸资源**（壁纸由用户自己放在本地目录里）；未使用
+Wallpaper Engine 的代码；`waywallen` 的 proto 数据模型（MIT）已注明来源。项目代码 MIT。

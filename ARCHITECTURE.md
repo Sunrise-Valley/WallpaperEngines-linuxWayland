@@ -16,7 +16,7 @@ layer, no embedded browser.
  │ UI — crates/wallpaper-hub                                              │
  │                                                                        │
  │  libcosmic application (COSMIC / iced)                                 │
- │   · library scan: Steam workshop dir → wallpaper list                   │
+ │   · library scan: local library roots (+ optional Steam dir) → list    │
  │   · workshop metadata browsing (thumbnails, search, paging)            │
  │   · detail panel: author user-properties (bool/color/text/combo/slider)│
  │   · settings: per-scene fps, render scale, effects, sleep policy       │
@@ -76,7 +76,7 @@ Requests:
 | Request | Meaning |
 |---|---|
 | `{"cmd":"status"}` | report what is playing, frame counts, cpu, rss |
-| `{"cmd":"apply","kind":"scene\|video\|image","path":"<dir or file>"}` | load and play |
+| `{"cmd":"apply","kind":"scene\|video\|image","path":"<dir, file or wallpaper id>"}` | load and play |
 | `{"cmd":"pause"}` / `{"cmd":"resume"}` | user pause, independent of occlusion |
 | `{"cmd":"quit"}` | tear down surfaces and exit |
 | `{"cmd":"set","fps":60}` | global frame rate |
@@ -108,7 +108,7 @@ verifying a build without the GUI:
 
 ```sh
 we-ctl status
-we-ctl apply-scene /path/to/workshop/431960/<id>
+we-ctl apply-scene ~/Templates/<id>      # a bare <id> works too: same library-root lookup
 we-ctl set-prop MyColor="1 0 0"
 we-ctl set fps=30
 ```
@@ -260,6 +260,33 @@ The kernel is deliberately stateless: the UI decides, the kernel executes. The o
 exception is a single "last applied" record so a restarted service does not leave the
 desktop empty. Per-wallpaper property overrides and per-scene frame rates live in the UI's
 config and are re-sent when the UI reconnects — the kernel does not remember preferences.
+That record stores a path, so it goes through the same id fallback as `apply` (4.6): a
+wallpaper that was moved to another library root is found again instead of the desktop
+coming up empty.
+
+### 4.6 Library roots (where the wallpapers come from)
+
+Both the UI and the kernel resolve wallpapers through the same list of **library roots**
+(`crates/wallpaper-hub/src/wp/library.rs`, mirrored in `crates/we-native/src/library.rs`
+because the kernel cannot depend on cosmic-config):
+
+| Source | Default |
+|---|---|
+| local library roots | `~/Templates` |
+| Steam workshop content (**optional**) | `~/.local/share/Steam/steamapps/workshop/content/431960`, plus `.steam/steam` and the Flatpak path, plus every `"path"` in `libraryfolders.vdf` — only those that exist |
+
+A root contains one directory per wallpaper (`<root>/<id>/` with `project.json` +
+`scene.pkg`, or `<root>/<any name>/` — the display name comes from `project.json`). A root
+that is itself a project also counts as one wallpaper. Roots are resolved as:
+`WPHUB_LIBRARY_DIRS` (env, colon-separated) → the UI's `library_dirs` config list →
+`~/.local/share/wallpaper-hub/library_dirs` → `~/Templates`. The UI writes that state file
+(UI roots *and* the optional Steam roots) and the kernel re-reads it on every `apply`, so
+changing the roots never needs a kernel restart.
+
+`apply` therefore accepts three things: an absolute directory, a file, or a bare
+**wallpaper id** (= directory name). If the path does not exist the kernel retries by id
+across the roots — which is what keeps a wallpaper working after it is moved out of the
+Steam tree. The same fallback is applied to `~/.cache/wallpaper-hub/last-applied`.
 
 ---
 
@@ -270,9 +297,11 @@ config and are re-sent when the UI reconnects — the kernel does not remember p
 | `~/.config/cosmic/…/wallpaper-hub/v1/` | UI | settings, per-scene fps table, per-wallpaper colour and property overrides |
 | `~/.cache/wallpaper-hub/` | UI | workshop metadata cache, promo image cache, thumbnails |
 | `~/.cache/wallpaper-hub/last-applied` | kernel | the single "restore this after restart" record |
+| `~/.local/share/wallpaper-hub/library_dirs` | UI writes, kernel reads | the effective library roots, one per line |
 | `$XDG_RUNTIME_DIR/we-native.sock` | kernel | control socket |
 
-Nothing is written into the Steam library. Workshop directories are opened read-only.
+Nothing is written into a Steam library, and no Steam account data is touched. Library
+directories are opened read-only.
 
 ---
 

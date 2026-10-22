@@ -81,7 +81,7 @@ export WE_FFMPEG=/usr/bin/ffmpeg          # only needed if ffmpeg is not on PATH
 
 # in another terminal
 ./scripts/we-ctl status
-./scripts/we-ctl apply-scene ~/.local/share/Steam/steamapps/workshop/content/431960/<id>
+./scripts/we-ctl apply-scene ~/Templates/<id>      # or just <id>: the kernel looks it up in the library roots
 ./scripts/we-ctl pause
 ./scripts/we-ctl quit
 ```

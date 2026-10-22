@@ -9,7 +9,7 @@ use crate::config::{self, Config};
 use crate::fl;
 use crate::promo;
 use crate::we_ui;
-use crate::wp::{local, native, proto, workshop};
+use crate::wp::{library, local, native, proto, workshop};
 use cosmic::app::context_drawer;
 use cosmic::cosmic_config::{self, CosmicConfigEntry};
 use cosmic::iced::alignment::{Horizontal, Vertical};
@@ -929,9 +929,10 @@ impl cosmic::Application for AppModel {
                 ),
             }
         }
-        // 启动就先用**本地扫描**把列表填上：daemon 在的话稍后会用它的覆盖（它的标签来自数据库，更全）；
-        // daemon 不在的话这份就是唯一来源 —— 自研后端不该因为别人没起来就变空列表。
-        app.adopt_wallpapers(local::scan());
+        // 启动就先用**本地扫描**把列表填上：扫的是**本地库根目录**（默认 `~/Templates`）
+        // 加可选的 Steam 工坊目录 —— 这个程序不需要 Steam 客户端，壁纸在哪就扫哪。
+        app.sync_library_roots();
+        app.adopt_wallpapers(local::scan_with(&app.config.library_dirs));
         // 启动参数：选中第一条 / 指定的那一条（截图/验证右侧详情面板）
         // 放在 --toggle-prop / --preset-* 之前：那两组参数都作用于「当前选中的那条」。
         // 走 `Message::Select` 这条**和点缩略图完全相同**的路（而不是直接调 select）：
@@ -2424,8 +2425,20 @@ impl AppModel {
 
     fn refresh_wallpapers(&mut self) {
         // 列表**永远**来自本地扫描：磁盘上 project.json + scene.pkg 就够（自研内核走这条路），
-        // 不用问任何人要。从前那条"问 daemon 要列表、连不上就退回本地"的分支已随 daemon 移除。
-        self.adopt_wallpapers(local::scan());
+        // 不用问任何人要。扫描根目录 = 用户自定义目录（默认 `~/Templates`）+ 可选的 Steam
+        // 工坊目录（`wp::library`）；Steam 没装就是少一处来源，不是错误。
+        self.sync_library_roots();
+        self.adopt_wallpapers(local::scan_with(&self.config.library_dirs));
+    }
+
+    /// 把**有效的**库根目录写进状态文件 `~/.local/share/wallpaper-hub/library_dirs`
+    /// （`wp::library`）：常驻内核按 id 找目录时读同一份 ⇒ 界面里换了目录之后
+    /// 内核**不用重启**也能找到新位置。写失败只是回到"内核只认自己的那几处"，不影响界面。
+    fn sync_library_roots(&self) {
+        let roots = library::roots(&self.config.library_dirs);
+        if let Err(e) = library::write_state(&roots) {
+            eprintln!("[库目录] 写不进 {}（{e}），内核将只用自己的默认根目录", library::state_file().display());
+        }
     }
 
     /// 用一份列表填界面；顺带累积"见过的类型/标签"，供筛选按钮用（不受当前筛选影响）。
@@ -3012,7 +3025,7 @@ impl AppModel {
 
         let body: Element<_> = if list.is_empty() {
             widget::container(we_ui::label(
-                "没有壁纸（或当前筛选下没有）。把 Wallpaper Engine 创意工坊下载的内容放进 Steam 的 workshop/content/431960，再点「刷新」。",
+                "没有壁纸（或当前筛选下没有）。把 scene 壁纸目录放进本地库根目录（默认 ~/Templates），再点「刷新」。不需要 Steam。",
                 12.0,
                 we_ui::ink_dim(),
             ))
@@ -6147,7 +6160,13 @@ impl AppModel {
         let spacing = cosmic::theme::spacing();
         let (scale, effects, sleep) = config::effective(&self.config);
         let current = config::preset_for(&scale, &effects, &sleep).unwrap_or("custom");
-        let dir = local::workshop_dir();
+        // 设置页底部显示**配置的**库根目录。只读配置、不探磁盘：这一行每帧都会重建，
+        // 而 `library::roots()` 要 stat 几个 Steam 候选目录 + 读 libraryfolders.vdf。
+        let dirs_text = if self.config.library_dirs.is_empty() {
+            "~/Templates（默认）".to_string()
+        } else {
+            self.config.library_dirs.join(" · ")
+        };
 
         let mut col = widget::column::with_capacity(14).spacing(spacing.space_s);
 
@@ -6316,7 +6335,7 @@ impl AppModel {
             .into();
         col = col.push(param_row("壁纸库", lib_row));
         col = col.push(we_ui::label(
-            format!("目录：{}", dir.display()),
+            format!("库目录：{dirs_text}（Steam 工坊目录若存在则一并扫描，不需要安装 Steam）"),
             11.0,
             we_ui::ink_dim(),
         ));
@@ -7337,9 +7356,11 @@ mod prop_tests {
     /// 打印「可编辑控件数 / 各跳过项 / 只读块数」，并钉住数字 —— 面板里不该再有没意义的输入框。
     #[test]
     fn real_projects_have_no_meaningless_editable_controls() {
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-        let base = std::path::PathBuf::from(home)
-            .join(".local/share/Steam/steamapps/workshop/content/431960");
+        // 本地库根目录（默认 `~/Templates`；"搬过家"的工坊内容照样找得到）
+        let base = crate::wp::library::roots(&[])
+            .into_iter()
+            .next()
+            .unwrap_or_default();
         let mut checked = 0;
         for id in ["2887537617", "3704273480"] {
             let dir = base.join(id);
@@ -7467,9 +7488,11 @@ mod prop_tests {
     /// ⇒ 这条近似规则在真数据上就是错的，所以不能用。
     #[test]
     fn no_group_signal_so_author_bools_stay_independent() {
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-        let base = std::path::PathBuf::from(home)
-            .join(".local/share/Steam/steamapps/workshop/content/431960");
+        // 本地库根目录（默认 `~/Templates`；"搬过家"的工坊内容照样找得到）
+        let base = crate::wp::library::roots(&[])
+            .into_iter()
+            .next()
+            .unwrap_or_default();
 
         let mut dirs: Vec<std::path::PathBuf> = std::fs::read_dir(&base)
             .map(|rd| rd.filter_map(|e| e.ok()).map(|e| e.path()).collect())
@@ -7730,9 +7753,11 @@ mod prop_tests {
     /// 色盘 ⇒ 10 → 7，**两边都 +1，差仍为 3**），所以这条测试也是那两次改动的回归网。
     #[test]
     fn real_projects_gate_rows_by_condition() {
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-        let base = std::path::PathBuf::from(home)
-            .join(".local/share/Steam/steamapps/workshop/content/431960");
+        // 本地库根目录（默认 `~/Templates`；"搬过家"的工坊内容照样找得到）
+        let base = crate::wp::library::roots(&[])
+            .into_iter()
+            .next()
+            .unwrap_or_default();
         fn props_of(base: &std::path::Path, id: &str) -> Option<Vec<Prop>> {
             let js = std::fs::read_to_string(base.join(id).join("project.json")).ok()?;
             let v: serde_json::Value = serde_json::from_str(&js).ok()?;

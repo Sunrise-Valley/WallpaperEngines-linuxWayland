@@ -64,6 +64,9 @@ mod audio;
 mod app_state;
 /// PipeWire/PulseAudio sink 枚举与选择（音频频谱"跟哪一路输出"）
 mod audio_sinks;
+/// **本地壁纸库根目录**：`apply` 给的路径不存在时，按壁纸 id 到各根目录
+/// （`~/Templates` 等用户目录 + 可选的 Steam 工坊目录）里找回来。
+mod library;
 mod cosmic_toplevel;
 mod watchdog;
 mod dump;
@@ -1158,13 +1161,26 @@ fn save_last_applied(kind: &str, path: &str) {
 }
 
 /// 读回状态；**路径不存在就当作没有**（壁纸目录被删/移动了就不该去恢复它）。
+///
+/// ⚠ 但"搬了个位置"≠"删了"：路径不存在时先按壁纸 id 到本地库根目录里找一次
+/// （壁纸从 Steam 工坊目录搬进 `~/Templates` 就是这种情况），找到就把记录改成新路径
+/// —— 否则每次开机都会"桌面空着"，而壁纸其实好端端在那儿。
 fn read_last_applied() -> Option<(String, String)> {
     let s = std::fs::read_to_string(last_applied_file()).ok()?;
     let mut it = s.lines();
     let kind = it.next()?.trim().to_string();
     let path = it.next()?.trim().to_string();
-    if kind.is_empty() || path.is_empty() || !std::path::Path::new(&path).exists() {
+    if kind.is_empty() || path.is_empty() {
         return None;
+    }
+    if !std::path::Path::new(&path).exists() {
+        let resolved = library::resolve_source(&path)?;
+        let new = resolved.to_string_lossy().into_owned();
+        if new != path {
+            println!("[库目录] 上次的壁纸不在 {path} 了 ⇒ 按 id 找到 {new}");
+            save_last_applied(&kind, &new);
+        }
+        return Some((kind, new));
     }
     Some((kind, path))
 }
@@ -2810,9 +2826,18 @@ impl Wall {
 
     /// 换源（控制面 apply）：图片=读进来画一次；视频=换 video_path，由 draw 去起解码器
     fn apply_source(&mut self, kind: &str, path: &str) -> Result<(), String> {
-        if !std::path::Path::new(path).exists() {
-            return Err(format!("路径不存在：{path}"));
+        // 路径不存在 ⇒ 按壁纸 id 到本地库根目录里再找一次（壁纸从 Steam 工坊目录搬到
+        // `~/Templates` 之后，界面那边可能还发着旧路径）。找得到就用真实路径，
+        // 找不到照旧报错 —— 不猜。
+        let resolved = match library::resolve_source(path) {
+            Some(p) => p,
+            None => return Err(format!("路径不存在：{path}")),
+        };
+        if resolved.to_string_lossy() != path {
+            println!("[库目录] {path} 不存在 ⇒ 按 id 找到 {}", resolved.display());
         }
+        let resolved_path = resolved.to_string_lossy().into_owned();
+        let path = resolved_path.as_str();
         self.ensure_surfaces();
         // 换任何源：视频的 0 拷贝状态（进程内解码器 + EGL 窗口）都要丢掉重建
         self.vdec = None;

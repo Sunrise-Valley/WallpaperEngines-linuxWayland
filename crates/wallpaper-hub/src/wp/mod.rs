@@ -2,11 +2,13 @@
 //
 //! 壁纸访问层。
 //!
-//! 三条路：`local`（自己扫工坊目录）、`workshop`（工坊元数据）、`native`（自研内核控制面）。
+//! 四条路：`library`（本地库根目录）、`local`（自己扫壁纸目录）、`workshop`（工坊元数据）、
+//! `native`（自研内核控制面）。
 //!
 //! `proto` 是数据模型（由 `proto/control.proto` 生成），只当"条目/类型"这些纯结构用；
 //! 协议调用已全部移除，统一 `allow(dead_code)`。
 
+pub mod library;
 pub mod local;
 pub mod native;
 pub mod workshop;
