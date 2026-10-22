@@ -2880,6 +2880,24 @@ mod tests {
             ("⑧ 仅显示 Approved", vec![], true, false),
         ];
         eprintln!("── 真网络：每条 URL 打一次 Steam（缓存目录 {}）", cache_root().display());
+        // 打一条 URL 并把结果印成一行（table 用）
+        let show = |name: &str, f: &Filter| {
+            let q = f.query();
+            let url = browse_url("", 1, "trend", &q);
+            let shown = url.replace("%5B%5D", "[]").replace("%20", " ");
+            match fetch_browse_page(&url) {
+                Ok(p) => eprintln!(
+                    "{name}\n  URL {shown}\n  excluded {} 项 → total_count={:?} · 本页 id {}",
+                    q.excluded.len(),
+                    p.total,
+                    p.ids.len()
+                ),
+                Err(e) => {
+                    eprintln!("{name}\n  URL {shown}\n  请求失败：{e}");
+                    panic!("真网络验收失败：{e}");
+                }
+            }
+        };
         for (name, unchecked, approved, reset_last) in scenarios {
             let mut f = Filter::default();
             for (g, t) in &unchecked {
@@ -2893,23 +2911,14 @@ mod tests {
                 f.reset();
                 assert_eq!(f, Filter::default(), "重置后必须等于 WE 默认筛选");
             }
-            let q = f.query();
-            let url = browse_url("", 1, "trend", &q);
-            let shown = url.replace("%5B%5D", "[]").replace("%20", " ");
-            let outcome = fetch_browse_page(&url);
-            match outcome {
-                Ok(p) => eprintln!(
-                    "{name}\n  URL {shown}\n  excluded {} 项 → total_count={:?} · 本页 id {}",
-                    q.excluded.len(),
-                    p.total,
-                    p.ids.len()
-                ),
-                Err(e) => {
-                    eprintln!("{name}\n  URL {shown}\n  请求失败：{e}");
-                    panic!("真网络验收失败：{e}");
-                }
-            }
+            show(name, &f);
         }
+
+        // ⑨ 单组「勾选」：把 WE 默认不勾的 Application 勾上 ⇒ 它从排除表里消失
+        let mut g = Filter::default();
+        assert!(g.toggle(G_TYPE, "Application"), "点一下 = 勾上");
+        assert!(!g.query().excluded.contains(&"Application".to_string()));
+        show("⑨ 勾选 type:Application（默认不勾）", &g);
     }
 
     /// 并行的核心约定：**保序**（缩略图/条目的显示顺序不能乱）+ 并发数真的有上限。
