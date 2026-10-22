@@ -138,10 +138,11 @@ EXTRA_DEPS="libegl1, libvulkan1"
 
 # Recommend, do not depend: video wallpapers need ffmpeg and the UI's wgpu path
 # needs a Vulkan driver, but neither is required to play scene wallpapers.
-# Steam is only Suggests — wallpapers come from the Workshop, yet Recommends
-# would make apt pull the i386 Steam client along with a wallpaper tool.
+# No Steam relation of any kind: the engine reads plain directories on disk
+# (library roots, default ~/Templates) and only *optionally* looks at a Steam
+# workshop directory if one already exists. Suggesting the Steam client here
+# would tell users they need it, which they do not.
 RECOMMENDS="ffmpeg, mesa-vulkan-drivers"
-SUGGESTS="steam | steam-installer"
 
 INSTALLED_SIZE="$(du -sk --exclude=DEBIAN "$STAGE" | cut -f1)"
 
@@ -155,7 +156,6 @@ Maintainer: $MAINTAINER
 Installed-Size: $INSTALLED_SIZE
 Depends: $SHLIBS_DEPS, $EXTRA_DEPS
 Recommends: $RECOMMENDS
-Suggests: $SUGGESTS
 Homepage: $HOMEPAGE
 Description: native Wallpaper Engine scene wallpaper engine for Wayland
  Plays Wallpaper Engine "scene" wallpapers natively on Wayland: it parses
@@ -168,8 +168,9 @@ Description: native Wallpaper Engine scene wallpaper engine for Wayland
  for browsing, applying and tuning wallpapers. Both run as systemd user units
  (wallpaper-native-kernel.service, wallpaper-hub.service).
  .
- Video wallpapers decode through ffmpeg, and wallpapers themselves come from
- Steam Workshop, hence the Recommends.
+ Video wallpapers decode through ffmpeg, hence the Recommends. Wallpapers are
+ read from plain directories on disk (library roots, default ~/Templates);
+ Steam is not required and not suggested.
 EOF
 
 # ----------------------------------------------------------- timestamps ----
