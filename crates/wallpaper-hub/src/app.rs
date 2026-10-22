@@ -160,15 +160,16 @@ pub struct AppModel {
     discover_error: Option<String>,
     discover_page: u32,
     discover_sort: usize,
-    /// 工坊页筛选，**与 Win 版 WE 面板同构**（6 组 / 黑名单取反 / 默认值照抄；
-    /// 语义见 `workshop::Filter::query`）。持久化见 `Config::workshop_filter_state`。
+    /// 「已安装」页当前页（本地列表，`PAGE_SIZE` 条一页）。筛选/搜索一变就回到第 1 页。
+    installed_page: u32,
+    /// 工坊页筛选，**与 Win 版 WE 面板同构**（黑名单取反 / 默认值照抄；语义见
+    /// `workshop::Filter::query`）。持久化见 `Config::workshop_filter_state`。
     discover_filter: workshop::Filter,
-    /// 「筛选」区是否展开（收起也记住 ⇒ 重启后还是上次那个样子）
-    discover_filter_open: bool,
-    /// 每一组现在是**展开**吗（`true` = 展开）。没记录的组用 `Group::collapsed`
-    /// 那个默认值（类型/年龄分级/分辨率收起，来源/标签展开 —— 和 WE 一致）。
-    /// 只存活于本次会话：WE 也只持久化筛选**值**，不持久化折叠态。
-    filter_collapsed: BTreeMap<String, bool>,
+    /// 折叠态：`键 = 是否展开`（[`FILTER_PANEL_KEY`] = 整个「筛选」区，其余是组键）。
+    /// 表里没有的键用**默认值**（`Group::expanded`，现在四组都是展开；用户 2026-10-22
+    /// 要求默认不折）。用户亲手折过/展开过的记在这张表里并落盘 `Config::workshop_fold`
+    /// ⇒ 重启后仍然是那个样子。
+    filter_fold: BTreeMap<String, bool>,
     /// 筛选防抖的状态机（代数 + 放行次数）：每勾一次 +1，300ms 后到的那条定时消息只有
     /// 代数仍相等才放行 ⇒ 连点 5 次只发**最后一次**请求（窗口见 `cfg::WS_FILTER_DEBOUNCE_MS`）。
     /// 抽成 [`FilterDebounce`] 是为了让"5 次点击 → 1 次放行"这件事能被单测断言。
@@ -212,6 +213,9 @@ pub struct AppModel {
     /// 主窗口的**逻辑宽度**（订阅 iced 的 resize 事件拿到）。
     /// 方块缩略图靠它自己算"每行放几个"，不写死列数。
     win_w: f32,
+    /// 窗口逻辑高度：只用来给「筛选」面板算高度上限（`filter_panel_max_h`），
+    /// 免得四组全展开时把缩略图网格挤成 0 高。
+    win_h: f32,
 
     // ── WE 皮肤：详情面板 / 逐壁纸属性编辑 ──────────────────────────────
     /// 详情面板里当前选中的壁纸 id（点缩略图 / 列表项）
@@ -359,7 +363,9 @@ pub enum Message {
     /// 发现页·渐进式填充：这一页的缩略图批结束（带统计；None = 起线程失败）
     DiscoverThumbsDone(Box<Option<workshop::Stats>>),
     DiscoverSortCycle,
-    DiscoverNextPage,
+    /// **翻页条**按下的页码（首页 / 上一页 / 7 个页码 / 下一页 / 尾页都发这一条）。
+    /// 落在哪一页由当前**活动页**决定：发现/工坊 ⇒ 发 Steam `p=N`；已安装 ⇒ 只切本地页。
+    PageGo(u32),
     /// 展开/收起工坊页的「筛选」区（纯 UI，不触发搜索 ⇒ 无防抖问题）
     DiscoverFilterToggle,
     /// 勾上/去勾一个筛选项：`(组键, 工坊标签原文)`。**勾选 = 不排除**（WE 语义）。
@@ -392,8 +398,9 @@ pub enum Message {
 
     // 页面切换（顶部横向标签）
     GoPage(Page),
-    /// 主窗口尺寸变了（逻辑像素）：缩略图网格据此重排列数
-    WindowResized(f32),
+    /// 主窗口尺寸变了（逻辑像素，宽 + 高）：缩略图网格据此重排列数，
+    /// 筛选面板的高度上限也按它算（不能把缩略图网格挤没）
+    WindowResized(f32, f32),
     /// 壁纸页·类型筛选（0 = 全部）—— 下拉选择，不再循环点击
     SetTypeFilter(usize),
     /// 壁纸页·标签筛选（0 = 全部）
@@ -485,7 +492,7 @@ fn msg_bucket(m: &Message) -> usize {
     match m {
         Message::NativeStatus(_) => 0,
         Message::NativeReply(..) => 1,
-        Message::WindowResized(_) => 2,
+        Message::WindowResized(..) => 2,
         Message::UpdateConfig(_) => 3,
         Message::DiscoverThumb(..) => 4,
         Message::DiscoverResult(_) => 5,
@@ -532,7 +539,7 @@ fn msg_name(m: &Message) -> &'static str {
         Message::PauseToggle => "PauseToggle",
         Message::NativeStatus(_) => "NativeStatus",
         Message::NativeReply(..) => "NativeReply",
-        Message::WindowResized(_) => "WindowResized",
+        Message::WindowResized(..) => "WindowResized",
         Message::WinEvent(_) => "WinEvent",
         Message::UpdateConfig(_) => "UpdateConfig",
         Message::PresetSave => "PresetSave",
@@ -800,11 +807,13 @@ impl cosmic::Application for AppModel {
             }
         };
 
-        // 工坊页筛选的初始状态：从持久配置读（`workshop_filter_state` / `workshop_filter_open`）。
+        // 工坊页筛选的初始状态：从持久配置读（`workshop_filter_state` / `workshop_fold`）。
         // 读出来先拷贝成局部量 —— 下面的结构体字面量里 `config` 会被 move 进去。
-        // `--workshop-filter-open` 只给截图用：强制展开筛选区（不然截不到那一块）。
+        // **默认全部展开**；只认认识的键（`panel` + 四个组的键），其余丢掉。
+        // `--workshop-filter-open` 是旧截图脚本的开关，现在默认就是展开 ⇒ 保留为**空操作**
+        // 兼容（老命令不会因此报错，也不会把用户折起来的状态顶掉）。
         let filter_lines = config.workshop_filter_state.clone();
-        let filter_open = config.workshop_filter_open || args.contains(&"--workshop-filter-open");
+        let filter_fold = fold_from_lines(&config.workshop_fold);
 
         // 2026-10-14：帧率**不再是全局的**。旧配置里那个全局 `fps` 键（曾经被拿来每次应用
         // 都下发、把场景自己的帧率盖成 30）现在既不被读取也不再写入 ⇒ 这里如实说一句。
@@ -905,15 +914,15 @@ impl cosmic::Application for AppModel {
             discover_t0: None,
             discover_error: None,
             discover_page: 1,
+            installed_page: 1,
             discover_sort: 0,
             // 筛选默认来自持久配置（用户要求"重启/切页后筛选状态保留"）：
             // 空表 = **WE 默认筛选**（排除 Application、只留大众级、分辨率全勾）；
             // 读出来先过一遍受控词表（`from_lines` 会丢掉不认识的组/标签），
             // 所以配置里残留的旧标签不会变成"发了却永远筛不到东西"的请求。
             discover_filter: workshop::Filter::from_lines(&filter_lines),
-            discover_filter_open: filter_open,
-            // 每组的折叠态只活本次会话（空表 = 用 `Group::collapsed` 的默认）
-            filter_collapsed: BTreeMap::new(),
+            // 折叠态：**不在表里 = 展开**（默认全展开；表里的是用户亲手折过的）
+            filter_fold,
             filter_debounce: FilterDebounce::new(),
             filter_searches: 0,
             filter_fetch_mark: 0,
@@ -939,6 +948,7 @@ impl cosmic::Application for AppModel {
                 .and_then(|i| args.get(i + 1))
                 .map(|s| s.to_string()),
             win_w: 1280.0,
+            win_h: 900.0,
             cpu_sample: None,
             cpu_pct: None,
             selected: None,
@@ -1267,7 +1277,9 @@ impl cosmic::Application for AppModel {
         let frame_paints_bg = self.core.window.content_container;
         widget::container(
             col.spacing(spacing.space_s)
-                .padding(spacing.space_s)
+                // 整页 padding：`space_s`（compact 主题只有 8）太挤 —— 用户 2026-10-22
+                // 「顺便检查整页 padding 不要拥挤」⇒ 提到 `space_m`（标准 24 / compact 16）。
+                .padding(spacing.space_m)
                 .height(Length::Fill),
         )
         .width(Length::Fill)
@@ -1287,7 +1299,7 @@ impl cosmic::Application for AppModel {
             }),
             native::subscription(),
             // 窗口尺寸：方块缩略图按它自动决定每行放几个
-            cosmic::iced::window::resize_events().map(|(_id, size)| Message::WindowResized(size.width)),
+            cosmic::iced::window::resize_events().map(|(_id, size)| Message::WindowResized(size.width, size.height)),
         ];
         // 脚本化拖动（验收）：10 ms 一拍 ⇒ 100 Hz 喂值，和真拖动同一个频率量级。
         // 等连上内核再开始（否则前几拍会落在"后台没起来"上，白丢值）。
@@ -1758,13 +1770,14 @@ impl cosmic::Application for AppModel {
                 }
             }
 
-            Message::WindowResized(w) => {
-                // 布局（每行几列 / 面板宽度）全靠这个数；`WPHUB_MSG_STATS=1` 时打出来，
-                // 免得截图量尺寸时靠猜。
+            Message::WindowResized(w, h) => {
+                // 布局（每行几列 / 面板宽度 / 筛选面板的高度上限）全靠这两个数；
+                // `WPHUB_MSG_STATS=1` 时打出来，免得截图量尺寸时靠猜。
                 if msg_stats_on() && (self.win_w - w).abs() > 0.5 {
                     eprintln!("[win] 窗口逻辑宽度 {w:.0}（面板 {} / 每行 {} 列）", panel_width(w, self.card_w()), tiles_per_row(w, self.card_w()));
                 }
                 self.win_w = w;
+                self.win_h = h;
             }
 
             Message::Refresh => self.refresh_all(),
@@ -1801,6 +1814,8 @@ impl cosmic::Application for AppModel {
 
             Message::SearchChanged(text) => {
                 self.search = text;
+                // 搜索词一变 ⇒ 列表条数/内容变 ⇒ 回到第 1 页
+                self.installed_page = 1;
                 self.refresh_wallpapers();
             }
 
@@ -1840,10 +1855,21 @@ impl cosmic::Application for AppModel {
                 let _ = upd_max_us_take();
                 let query = self.discover_query.clone();
                 let page = self.discover_page;
-                let sort = workshop::SORTS[self.discover_sort % workshop::SORTS.len()].0;
+                // **排序口径按当前页算**：发现页恒为 `trend`（热度推荐），工坊页是用户选的
+                // 那一档。抽在 `BrowseSurface::sort_key` 里 ⇒ 单测能钉住"发现页一定是 trend"。
+                let surface = self.browse_surface();
+                let sort = surface.sort_key(self.discover_sort);
                 // 筛选是**多选**的：搜索线程里要按组合各发一次 browse（组内 OR、组间 AND），
                 // 所以把 Filter 整个搬进阻塞任务（它是 Clone 的纯数据）。
-                let filter = self.discover_filter.clone();
+                //
+                // ⚠ **发现页（热度推荐）不带工坊页挑的筛选**：否则用户在工坊页勾的东西会
+                // 悄悄改变热度榜的内容。热度页用 `Filter::default()`（= WE 默认：排除
+                // Application / R-18 / 未指定），这既是基准口径，也不会把成人内容摊到首页。
+                let filter = if surface.shows_filter() {
+                    self.discover_filter.clone()
+                } else {
+                    workshop::Filter::default()
+                };
                 return Task::perform(
                     async move {
                         // HTTP 是阻塞式，放到线程池，别卡住 UI
@@ -2006,9 +2032,25 @@ impl cosmic::Application for AppModel {
                     .update(Message::DiscoverRunSearch);
             }
 
-            Message::DiscoverNextPage => {
-                self.discover_page += 1;
-                return self.update(Message::DiscoverRunSearch);
+            // 翻页条：三个页共用一条消息，落点由**当前活动页**决定
+            // （已安装 = 本地切片；发现/工坊 = 重新发一次 browse `p=N`）
+            Message::PageGo(page) => {
+                let page = page.max(1);
+                match self.nav.active_data::<Page>().copied() {
+                    Some(Page::Wallpapers) => {
+                        let total = page_count(self.filtered_wallpapers().len(), PAGE_SIZE);
+                        self.installed_page = clamp_page(page, total);
+                        return Task::none();
+                    }
+                    Some(Page::Discover) | Some(Page::Workshop) => {
+                        if page == self.discover_page {
+                            return Task::none();
+                        }
+                        self.discover_page = page;
+                        return self.update(Message::DiscoverRunSearch);
+                    }
+                    _ => return Task::none(),
+                }
             }
 
             // ── 工坊页·筛选（与 WE 面板同构：勾选 = 不排除）────────────────────
@@ -2017,15 +2059,34 @@ impl cosmic::Application for AppModel {
             // 300ms 后的定时消息；定时消息到点时只有"代数还是我这一代"才真的去搜。
             // 于是连点 5 次只有一个定时器活下来 ⇒ 一次 release ⇒ 一次 browse。
             Message::DiscoverFilterToggle => {
-                self.discover_filter_open = !self.discover_filter_open;
+                // 折起来/展开**整块**筛选区：纯 UI，不触发搜索；状态落盘（用户要求记得住）
+                let now_open =
+                    toggle_fold(&mut self.filter_fold, FILTER_PANEL_KEY, true);
+                eprintln!(
+                    "[filter] 筛选区 → {}（{}）",
+                    if now_open { "展开" } else { "收起" },
+                    self.filter_fold_line()
+                );
                 self.persist_filter();
             }
 
             Message::DiscoverFilterCollapse(key) => {
-                let group = workshop::GROUPS.iter().find(|g| g.key == key);
-                let default_collapsed = group.is_some_and(|g| g.collapsed);
-                let open = self.filter_group_open(&key, default_collapsed);
-                self.filter_collapsed.insert(key, !open);
+                // 组头那一行：折起来/展开某一组。**默认展开**，表里只记"折起来的"。
+                if key != FILTER_PANEL_KEY && !workshop::GROUPS.iter().any(|g| g.key == key) {
+                    eprintln!("[filter] 折叠 {key:?}：不是已知组 ⇒ 忽略");
+                    return Task::none();
+                }
+                let default_open = workshop::GROUPS
+                    .iter()
+                    .find(|g| g.key == key)
+                    .is_none_or(|g| g.expanded);
+                let now_open = toggle_fold(&mut self.filter_fold, &key, default_open);
+                eprintln!(
+                    "[filter] 组 {key} → {}（{}）",
+                    if now_open { "展开" } else { "收起" },
+                    self.filter_fold_line()
+                );
+                self.persist_filter();
             }
 
             Message::DiscoverFilterToggleTag(key, tag) => {
@@ -2189,10 +2250,13 @@ impl cosmic::Application for AppModel {
             // 列表每帧由 `filtered_wallpapers()` 现算，所以不用重扫磁盘。
             Message::SetTypeFilter(i) => {
                 self.type_filter = i.min(self.known_types.len());
+                // 换了筛选 ⇒ 回到第 1 页（否则停在一个已经不存在的页上）
+                self.installed_page = 1;
             }
 
             Message::SetTagFilter(i) => {
                 self.tag_filter = i.min(self.known_tags.len());
+                self.installed_page = 1;
             }
 
             // ── WE 皮肤：详情面板 / 逐壁纸属性编辑 ─────────────────────────
@@ -2343,6 +2407,7 @@ impl cosmic::Application for AppModel {
 
             Message::SetSort(i) => {
                 self.sort = i.min(SORTS.len() - 1);
+                self.installed_page = 1;
             }
 
             // 卡片尺寸档（小/中/大）：只改渲染宽度 ⇒ 列数/行数按新宽度重算（同一帧就重排）。
@@ -2531,7 +2596,8 @@ impl AppModel {
     /// 用户要求"重启/切页后筛选状态保留"，所以不攒、不留到退出时再写（退出可能来不及）。
     fn persist_filter(&mut self) {
         self.config.workshop_filter_state = self.discover_filter.to_lines();
-        self.config.workshop_filter_open = self.discover_filter_open;
+        // 折叠态：`键=1|0` 一行一条（与筛选值同一种写法）
+        self.config.workshop_fold = self.fold_lines();
         let Some(ctx) = &self.config_ctx else {
             eprintln!("[filter] 没有配置句柄：这次筛选状态只在本次会话有效");
             return;
@@ -3291,7 +3357,13 @@ impl AppModel {
     /// 已安装页：WE 式搜索行（搜索框 + 筛选/排序）+ 16:9 缩略图网格。
     fn view_wallpapers(&self) -> Element<'_, Message> {
         let spacing = cosmic::theme::spacing();
-        let list = self.filtered_wallpapers();
+        // 整份（筛选/排序之后）与**这一页**分开：翻页只切本地的这一段，
+        // 顶部那行「N 张」仍然报总数（用户要的是"库里有多少"，不是"这页多少"）。
+        let all = self.filtered_wallpapers();
+        let pages = page_count(all.len(), PAGE_SIZE);
+        let cur_page = clamp_page(self.installed_page, pages);
+        let (from, to) = page_bounds(cur_page, all.len(), PAGE_SIZE);
+        let list: Vec<&proto::WallpaperEntry> = all[from..to].to_vec();
 
         let type_label = if self.type_filter == 0 {
             "全部".to_string()
@@ -3427,7 +3499,11 @@ impl AppModel {
 
         let body: Element<_> = if list.is_empty() {
             widget::container(we_ui::label(
-                "没有壁纸（或当前筛选下没有）。把 scene 壁纸目录放进本地库根目录（默认 ~/Templates），再点「刷新」。不需要 Steam。",
+                if all.is_empty() {
+                    "没有壁纸（或当前筛选下没有）。把 scene 壁纸目录放进本地库根目录（默认 ~/Templates），再点「刷新」。不需要 Steam。"
+                } else {
+                    "这一页是空的（条数刚刚变少）—— 用下面的翻页条回到别的页。"
+                },
                 12.0,
                 we_ui::ink_dim(),
             ))
@@ -3465,9 +3541,17 @@ impl AppModel {
             widget::scrollable(rows).height(Length::Fill).into()
         };
 
-        widget::column::with_capacity(2)
+        widget::column::with_capacity(4)
             .push(header)
+            // ★ 工具栏（「尺寸」滑杆就在这一行）与第一排壁纸之间留出间距
+            .push(
+                widget::container(cosmic::iced::widget::space::vertical())
+                    .width(Length::Fill)
+                    .height(Length::Fixed(HEADER_GAP)),
+            )
             .push(body)
+            // 翻页条：**单独一行、贴内容区底部**（用户 2026-10-22）
+            .push(self.view_page_bar(cur_page, Some(pages)))
             .spacing(spacing.space_s)
             .height(Length::Fill)
             .into()
@@ -3559,24 +3643,36 @@ impl AppModel {
     }
 
 
-    /// 发现页：创意工坊热门内容，用**和已安装页一样的 16:9 格子**铺开。
+    /// 发现页 = **热度推荐**：不显示筛选面板，排序固定 Steam `browsesort=trend`
+    /// （用户 2026-10-22：「发现页去掉筛选，做成热度推荐」）。
     fn view_discover(&self) -> Element<'_, Message> {
-        self.view_workshop_body(true)
+        self.view_browse(BrowseSurface::Hot)
     }
 
-    /// 创意工坊页：关键词搜索 + 排序 + 翻页（缩略图网格，和发现页一致；用户 2026-10-21 要求）。
+    /// 创意工坊页：关键词搜索 + 排序 + **筛选面板**（与 Win 版 WE 面板同构）+ 底部翻页。
+    /// 筛选只在这一页有（发现页没有）；两页共用同一条搜索结果，互不影响各自的面板。
     fn view_workshop(&self) -> Element<'_, Message> {
-        self.view_workshop_body(true)
+        self.view_browse(BrowseSurface::Workshop)
     }
 
-    /// 两页共用的工坊视图：`as_grid` = 缩略图网格（发现页）还是列表（创意工坊页）。
-    fn view_workshop_body(&self, as_grid: bool) -> Element<'_, Message> {
+    /// 两页共用的浏览视图。区别只有三处（都收在 [`BrowseSurface`] 里）：
+    /// **标题/副标题**、**有没有筛选面板**、**排序是不是钉死成热度**。
+    ///
+    /// 布局（自顶向下）：标题行 → 工具行（搜索/浏览器/排序）→［筛选面板（仅工坊页）］
+    /// → 状态卡 → 缩略图网格 → **底部翻页行**（单独一行，用户 2026-10-22 要求）。
+    fn view_browse(&self, surface: BrowseSurface) -> Element<'_, Message> {
         let spacing = cosmic::theme::spacing();
-        let sort_label = workshop::SORTS[self.discover_sort % workshop::SORTS.len()].1;
-        let sort_txt = format!("排序: {sort_label}");
-        let page_txt = format!("第 {} 页 →", self.discover_page);
+        let (title, subtitle) = surface.title();
 
-        let header = widget::row::with_capacity(4)
+        // ── 标题行：大标题 + 副标题。「热度推荐」这件事必须写在界面上，不靠猜 ──
+        let head = widget::column::with_capacity(2)
+            .push(we_ui::label(title, 16.0, we_ui::ink_text()))
+            .push(we_ui::label(subtitle, 11.0, we_ui::ink_dim()))
+            .spacing(2.0)
+            .width(Length::Fill);
+
+        // ── 工具行：搜索框 + 搜索 + 在浏览器打开（+ 工坊页的排序按钮）──
+        let mut tools = widget::row::with_capacity(4)
             .push(
                 widget::container(
                     widget::text_input("搜索创意工坊（留空看趋势）…", &self.discover_query)
@@ -3598,29 +3694,27 @@ impl AppModel {
                 we_ui::gray_class(),
                 Message::DiscoverSearch,
             ))
-            .push(
-                widget::container(
-                    widget::row::with_capacity(2)
-                        .push(we_ui::icon_button(
-                            sort_txt,
-                            "view-sort-ascending-symbolic",
-                            we_ui::gray_class(),
-                            Message::DiscoverSortCycle,
-                        ))
-                        .push(we_ui::icon_button(
-                            page_txt,
-                            "go-next-symbolic",
-                            we_ui::gray_class(),
-                            Message::DiscoverNextPage,
-                        ))
-                        .spacing(spacing.space_xs)
-                        .align_y(Alignment::Center),
-                )
-                .width(Length::Fill)
-                .align_x(Horizontal::Right),
-            )
             .spacing(spacing.space_xs)
             .align_y(Alignment::Center);
+        // 排序只在工坊页可改；发现页固定热度 ⇒ **不画那个按钮**（画了也没得选）
+        if surface.sort_editable() {
+            let sort_label = workshop::SORTS[self.discover_sort % workshop::SORTS.len()].1;
+            tools = tools.push(
+                widget::container(we_ui::icon_button(
+                    format!("排序: {sort_label}"),
+                    "view-sort-ascending-symbolic",
+                    we_ui::gray_class(),
+                    Message::DiscoverSortCycle,
+                ))
+                .width(Length::Fill)
+                .align_x(Horizontal::Right),
+            );
+        }
+        let header = widget::column::with_capacity(2)
+            .push(head)
+            .push(tools)
+            .spacing(spacing.space_xs)
+            .width(Length::Fill);
 
         // 本地已下载的工坊 ID（用 external_id 对照）
         let local_ids: std::collections::HashSet<&str> = self
@@ -3636,6 +3730,12 @@ impl AppModel {
             .count();
 
         let mut status = vec![format!("工坊结果 {} 条", self.discover_items.len())];
+        // **排序口径**直接印在状态条上：发现页恒为 `browsesort=trend`，工坊页是用户选的那一档
+        status.push(format!(
+            "排序 = {}（browsesort={}）",
+            surface.sort_label(self.discover_sort),
+            surface.sort_key(self.discover_sort)
+        ));
         // 页面里的链接次数 vs 上屏的唯一 id：两个数**分开印**，因为 Steam 的 browse 页对
         // 每个条目有**两处**链接（缩略图 + 标题）⇒ 30 条的页面上是 60 次出现，
         // 那是"页面内部重复"（解析时已按 id 折叠），**不是**列表里列了两格同一 id。
@@ -3706,22 +3806,42 @@ impl AppModel {
             .padding([4.0, 8.0])
             .style(we_ui::card_style);
 
+        // **底部翻页条**：单独一行、贴内容区底部（用户 2026-10-22：
+        // 「翻页单独一行、放最下面」，不再和工具栏挤在一起）。三个页共用同一套控件。
+        let pagebar = self.view_page_bar(self.discover_page, self.browse_pages_total());
+
+        // 空列表 = 还没搜 / 这个筛选下没东西：给一句人话，但**翻页条照样画**
         if self.discover_items.is_empty() && !self.discover_loading {
-            return widget::column::with_capacity(4)
+            let mut col = widget::column::with_capacity(5)
                 .push(header)
-                .push(self.view_workshop_filter())
+                .spacing(spacing.space_s)
+                .height(Length::Fill);
+            if surface.shows_filter() {
+                // 与主路径同一套：**高度上限 + 内部滚动**（四组默认展开很高）
+                col = col.push(
+                    widget::container(
+                        widget::scrollable(self.view_workshop_filter()).width(Length::Fill),
+                    )
+                    .width(Length::Fill)
+                    .max_height(filter_panel_max_h(self.win_h)),
+                );
+            }
+            return col
                 .push(status_card)
                 .push(we_ui::label(
-                    "点「搜索」拉取创意工坊的热门内容（可先不填关键词）。下载后的条目会自动出现在「已安装」页。",
+                    if surface.shows_filter() {
+                        "点「搜索」拉取创意工坊的内容（可先不填关键词）。下载后的条目会自动出现在「已安装」页。"
+                    } else {
+                        "点「搜索」拉取创意工坊的热度榜（可先不填关键词）。下载后的条目会自动出现在「已安装」页。"
+                    },
                     12.0,
                     we_ui::ink_dim(),
                 ))
-                .spacing(spacing.space_s)
-                .height(Length::Fill)
+                .push(pagebar)
                 .into();
         }
 
-        let body: Element<_> = if as_grid {
+        let body: Element<_> = {
             let per_row = tiles_per_row(self.win_w, self.card_w());
             let mut rows =
                 widget::column::with_capacity(self.discover_items.len() / per_row + 1).spacing(TILE_GAP);
@@ -3744,37 +3864,114 @@ impl AppModel {
                 );
             }
             widget::scrollable(rows).height(Length::Fill).into()
-        } else {
-            let mut list =
-                widget::column::with_capacity(self.discover_items.len().max(1)).spacing(spacing.space_xs);
-            for item in &self.discover_items {
-                list = list.push(self.workshop_row(item, local_ids.contains(item.id.as_str())));
-            }
-            widget::scrollable(list).height(Length::Fill).into()
         };
 
-        widget::column::with_capacity(4)
+        let mut col = widget::column::with_capacity(5)
             .push(header)
-            .push(self.view_workshop_filter())
-            .push(status_card)
-            .push(body)
             .spacing(spacing.space_s)
-            .height(Length::Fill)
+            .height(Length::Fill);
+        // ── 筛选面板（仅工坊页）──
+        // **四组默认全展开**之后这一块比以前高很多；给它一个**高度上限**（窗口的 42%）+
+        // 内部滚动，绝不把下面的缩略图网格挤成 0 高。收起时自然只有标题那一行。
+        if surface.shows_filter() {
+            col = col.push(
+                widget::container(
+                    widget::scrollable(self.view_workshop_filter()).width(Length::Fill),
+                )
+                .width(Length::Fill)
+                .max_height(filter_panel_max_h(self.win_h)),
+            );
+        }
+        col.push(status_card).push(body).push(pagebar).into()
+    }
+
+    /// 当前活动页是哪个浏览面（只有「发现」「创意工坊」会发 browse 请求；其它页按工坊页算，
+    /// 反正那两页共用同一条搜索链）。
+    fn browse_surface(&self) -> BrowseSurface {
+        match self.nav.active_data::<Page>().copied() {
+            Some(Page::Discover) => BrowseSurface::Hot,
+            _ => BrowseSurface::Workshop,
+        }
+    }
+
+    /// 工坊浏览的总页数：Steam 在结果页里报了总条数（`discover_total`）时按
+    /// [`PAGE_SIZE`] 折算；没报（老页面/解析失败）就 `None` ⇒ 翻页条按"总页未知"画
+    /// （下一页可点、尾页置灰）。
+    fn browse_pages_total(&self) -> Option<u32> {
+        self.discover_total.map(|t| page_count(t as usize, PAGE_SIZE))
+    }
+
+    /// **底部翻页条**：`首页 / 上一页 / 最近 7 个页码 / 下一页 / 尾页`。
+    ///
+    /// * 放在内容区**最下面单独一行**（调用方保证：它是页面的最后一个孩子）；
+    /// * 当前页 = 强调色实心 + 不可再点（点它也只会回到同一页）；
+    /// * 不可用（第一页时的"上一页"、最后一页时的"下一页"、总页未知时的"尾页"）= 置灰且
+    ///   **不挂消息**（按下去什么都没发生，这正是"置灰"该有的行为）。
+    fn view_page_bar(&self, current: u32, total: Option<u32>) -> Element<'_, Message> {
+        let spacing = cosmic::theme::spacing();
+        // 总页未知时，围绕当前页算出"看得见"的那一段（不假装知道末尾）
+        let pages = total.unwrap_or_else(|| clamp_page(current, u32::MAX).max(1) + PAGE_NUMBERS);
+        let cur = clamp_page(current, pages);
+        let prev_ok = cur > 1;
+        // 有总数 ⇒ 按总数判；没总数 ⇒ 允许试下一页（尾页不知道在哪，置灰）
+        let next_ok = total.map_or(true, |t| cur < t.max(1));
+        let last_ok = total.is_some_and(|t| cur < t.max(1));
+
+        let mut row = widget::row::with_capacity(PAGE_NUMBERS as usize + 4)
+            .spacing(spacing.space_xxs)
+            .align_y(Alignment::Center);
+        row = row.push(page_button("⏮ 首页", prev_ok, false, Message::PageGo(1)));
+        row = row.push(page_button(
+            "◀ 上一页",
+            prev_ok,
+            false,
+            Message::PageGo(cur.saturating_sub(1)),
+        ));
+        for p in page_window(cur, pages) {
+            row = row.push(page_button(format!("{p}"), true, p == cur, Message::PageGo(p)));
+        }
+        row = row.push(page_button(
+            "下一页 ▶",
+            next_ok,
+            false,
+            Message::PageGo(cur.saturating_add(1)),
+        ));
+        row = row.push(page_button("尾页 ⏭", last_ok, false, Message::PageGo(pages)));
+        row = row.push(
+            widget::container(we_ui::label(
+                match total {
+                    Some(t) => format!("第 {cur} / {} 页 · 每页 {PAGE_SIZE} 条", t.max(1)),
+                    None => format!("第 {cur} 页 · 每页 {PAGE_SIZE} 条（总页未知）"),
+                },
+                11.0,
+                we_ui::ink_dim(),
+            ))
+            .width(Length::Fill)
+            .align_x(Horizontal::Right),
+        );
+
+        widget::container(row)
+            .width(Length::Fill)
+            .padding([6.0, 8.0])
+            .style(we_ui::card_style)
             .into()
     }
 
     /// 工坊页的「筛选」区：**照抄 Win 版 WE 面板的结构与语义**。
     ///
-    /// * 六组、**顺序与 WE 一致**（`仅显示` → 类型 → 年龄分级 → 分辨率 → 来源 → 标签）；
+    /// * 四组、**顺序与 WE 一致**（`仅显示` → 类型 → 年龄分级 → 分辨率 → 标签）；
+    ///   「来源」组已按用户要求删掉（Official/Workshop/Local 对浏览页没有意义）；
     /// * **勾选 = 不排除**（黑名单取反，见 `workshop::Filter::query`）：
     ///   组内只排"未勾"的 = OR，多组各自的排除叠加在**一条**查询里 = AND；
-    /// * 默认收起状态也照抄（`Group::collapsed`：类型/年龄分级/分辨率收起，来源/标签展开）；
+    /// * **默认全部展开**（`Group::expanded` = true）；用户亲手折起来的组/整块面板
+    ///   记在 `filter_fold` 并落盘 ⇒ 下次打开还是那个样子；
     /// * 「重置过滤器」= **回到默认筛选**（不是清空），并且套 `defaultfilterconfig`；
     /// * 分辨率 5 个宽高比子组各带「所有 / 无」，标签组在组头上一对；
     /// * **防抖**：勾选只改状态 + 排一条 300ms 定时消息，不立刻打网络。
     fn view_workshop_filter(&self) -> Element<'_, Message> {
         let spacing = cosmic::theme::spacing();
         let changed = self.discover_filter.changed_count();
+        let panel_open = self.filter_panel_open();
         let head_label = if changed == 0 {
             "筛选".to_string()
         } else {
@@ -3783,7 +3980,7 @@ impl AppModel {
         let head = widget::row::with_capacity(3)
             .push(we_ui::icon_button(
                 head_label,
-                if self.discover_filter_open {
+                if panel_open {
                     "go-up-symbolic"
                 } else {
                     "go-down-symbolic"
@@ -3812,7 +4009,7 @@ impl AppModel {
         let mut col = widget::column::with_capacity(8)
             .push(head)
             .spacing(spacing.space_xxs);
-        if !self.discover_filter_open {
+        if !panel_open {
             // 收起时只留摘要：`类型 4/5 · 标签 20/25`（默认状态显示"WE 默认筛选"）
             col = col.push(we_ui::label(
                 self.discover_filter.describe(),
@@ -3843,12 +4040,33 @@ impl AppModel {
             .into()
     }
 
-    /// 某一组现在是展开吗？用户没点过就用 `Group::collapsed`（WE 的默认折叠态）。
-    fn filter_group_open(&self, key: &str, default_collapsed: bool) -> bool {
-        match self.filter_collapsed.get(key) {
-            Some(open) => *open,
-            None => !default_collapsed,
+    /// 某一组现在是展开吗？用户没动过 ⇒ `Group::expanded`（现在四组都是 true）。
+    fn filter_group_open(&self, group: &workshop::Group) -> bool {
+        fold_open(&self.filter_fold, group.key, group.expanded)
+    }
+
+    /// 整块「筛选」区现在展开吗？（默认展开；键是 [`FILTER_PANEL_KEY`]）
+    fn filter_panel_open(&self) -> bool {
+        fold_open(&self.filter_fold, FILTER_PANEL_KEY, true)
+    }
+
+    /// 折叠态落盘成 `键=1|0` 行（只写表里的 = 与默认不同的那些）。
+    fn fold_lines(&self) -> Vec<String> {
+        fold_to_lines(&self.filter_fold)
+    }
+
+    /// 一行日志摘要：`panel=收起 · type=收起`（没动过 = `全部展开`）
+    fn filter_fold_line(&self) -> String {
+        if self.filter_fold.is_empty() {
+            return "全部展开".to_string();
         }
+        let mut pairs: Vec<String> = self
+            .filter_fold
+            .iter()
+            .map(|(k, open)| format!("{k}={}", if *open { "展开" } else { "收起" }))
+            .collect();
+        pairs.sort();
+        pairs.join(" · ")
     }
 
     /// 「仅显示」组（不可折叠）：`Approved` → `requiredtags[]`；手机兼容 → 额外排除两项。
@@ -3891,7 +4109,7 @@ impl AppModel {
 
     /// 一个筛选组：可折叠的组头（带"（已筛选）"角标）+ 若干小节。
     fn view_filter_group(&self, group: &'static workshop::Group) -> Element<'_, Message> {
-        let open = self.filter_group_open(group.key, group.collapsed);
+        let open = self.filter_group_open(group);
         let changed = self.discover_filter.group_changed(group.key);
         let title_row = widget::row::with_capacity(2)
             .push(widget::text(if open { "▾" } else { "▸" }).size(11))
@@ -4115,7 +4333,12 @@ impl AppModel {
             .into()
     }
 
-    /// 工坊条目：列表行（创意工坊页用，标签/体积/工坊自己的订阅数都摆出来）
+    /// 工坊条目：**列表行**（缩略图 + 标题 + id/标签 chips + [工坊页]）。
+    ///
+    /// ⚠ 目前两个浏览页都用 16:9 格子（[`Self::workshop_tile`]）⇒ 这一行暂时**没有入口**。
+    /// 留着而不是删掉：它是"同一份数据换种排法"的现成实现（有 id 在前、标签在后那套
+    /// 核对口径），以后要加「列表/格子」切换时不用重写。`allow(dead_code)` 就是为了这个。
+    #[allow(dead_code)]
     fn workshop_row<'a>(
         &'a self,
         item: &'a workshop::Item,
@@ -4727,6 +4950,17 @@ impl AppModel {
                 .align_x(Horizontal::Center),
         );
 
+        // ★ **壁纸图与下面的标题/属性控件之间留出固定间距**（用户 2026-10-22：
+        //   「滑动条与壁纸之间加间距，至少 12–16px，不要贴在一起」）。
+        //   这里用一段**固定高度**的空白而不是只靠列的 `spacing`：主题若走 compact，
+        //   `space_s` 只有 8px，量出来就还是贴着的。`PREVIEW_GAP = 16` ⇒ 实际间距
+        //   ≥ 16 + 列 spacing，任何主题下都满足 ≥12。
+        col = col.push(
+            widget::container(cosmic::iced::widget::space::vertical())
+                .width(Length::Fill)
+                .height(Length::Fixed(PREVIEW_GAP)),
+        );
+
         // 2) 居中标题
         col = col.push(
             widget::container(we_ui::label(entry.name.clone(), 16.0, we_ui::ink_text()))
@@ -5079,9 +5313,18 @@ impl AppModel {
 
         // 这一段现在挂在「属性」那个 rows 列里（见 `view_detail`），父容器已经留出
         // `SCROLL_PAD`（滚动条叠画在内容上）⇒ 这里**不再重复留右内边距**，免得图偏窄。
-        let el: Element<'a, Message> = widget::column::with_capacity(2)
+        //
+        // ★ 末尾留 `PREVIEW_GAP`：这张/这几张宣传图（也是"壁纸图"）**下面**紧跟着
+        //   就是作者属性控件（滑动条/下拉框），用户 2026-10-22 要求至少 12–16px 的
+        //   间距 —— 属性行的 `ROW_GAP` 只有 4，靠它不够。
+        let el: Element<'a, Message> = widget::column::with_capacity(3)
             .push(we_ui::section("宣传图"))
             .push(widget::container(items).width(Length::Fill))
+            .push(
+                widget::container(cosmic::iced::widget::space::vertical())
+                    .width(Length::Fill)
+                    .height(Length::Fixed(PREVIEW_GAP)),
+            )
             .spacing(spacing.space_s)
             .into();
         Some(el)
@@ -5670,6 +5913,32 @@ const CARD_DEFAULT: usize = 1;
 /// 这是**真间距**（行/列的 `spacing`），不是靠给卡片加内边距充数；24 ≈ 上一轮 8 的 3 倍，
 /// 量出来相邻两张卡片的缝隙就是 24 px（见 `layout_tests::tile_gap_is_measured_gap`）。
 const TILE_GAP: f32 = 24.0;
+
+/// **属性控件与壁纸图之间的最小垂直间距**（用户 2026-10-22：「滑动条与壁纸之间加间距，
+/// 至少 12–16px，不要贴在一起」）。
+///
+/// 它是一段**固定高度的空白**（`view_detail` 里紧跟在预览图之后 push 一个这么高的
+/// `container`），所以不依赖主题的 density：即便主题是 compact（`space_s = 8`），
+/// 量出来也不会少于这个数。单测 `detail_preview_gap_is_at_least_12` 钉住下限，
+/// 截图量像素见 `artifacts/ui5-20261022/`。
+const PREVIEW_GAP: f32 = 16.0;
+
+/// **工具栏（含「尺寸」那根滑杆）与壁纸缩略图之间的额外间距**（用户 2026-10-22：
+/// 「滑动条与壁纸之间加间距」）。滚轮/滑杆就在第一排缩略图正上方，只靠列的 `spacing`
+/// 在紧凑主题下只有 8px ⇒ 这里再垫一段固定空白（实测 20 → 32px）。
+const HEADER_GAP: f32 = 12.0;
+
+/// **一页多少条**（发现/工坊/已安装三个页共用）：与 Steam browse 页的 `numperpage=30`
+/// 对齐 —— 页码 → `p=N` 才是同一个口径（工坊页翻页就是直接发 `p=N`）。
+const PAGE_SIZE: usize = 30;
+
+/// 底部翻页条中间显示**几个**页码（用户要求：最近 7 个）
+const PAGE_NUMBERS: u32 = 7;
+
+/// 「筛选」区折叠状态在 [`AppModel::filter_fold`] / `Config::workshop_fold`
+/// 里的键：整个面板（组键走 `workshop::GROUPS[*].key`）。
+const FILTER_PANEL_KEY: &str = "panel";
+
 /// 右侧详情/属性面板的宽度（加宽到 540 —— 落在要求的 520~560 区间内）
 const PANEL_W: f32 = 540.0;
 
@@ -5765,6 +6034,180 @@ fn panel_width(win_w: f32, card_w: f32) -> f32 {
 fn tiles_per_row(win_w: f32, card_w: f32) -> usize {
     let avail = (win_w - panel_width(win_w, card_w) - CHROME_X).max(card_w);
     (((avail + TILE_GAP) / (card_w + TILE_GAP)).floor() as usize).clamp(1, 12)
+}
+
+/// ── 翻页（三个页共用的一套纯函数）────────────────────────────────────────────
+///
+/// 用户 2026-10-22：「翻页单独一行、放最下面；控件顺序 首页 / 上一页 / 最近 7 个页码 /
+/// 下一页 / 尾页；当前页高亮、不可用时置灰」。判据全在这几个函数里 ⇒ 能单测，
+/// 界面只负责画（不自己算错一次）。
+
+/// 总页数。0 条也算 **1 页**（界面上永远有"第 1 / 1 页"，而不是 0 页的怪物）。
+fn page_count(items: usize, per_page: usize) -> u32 {
+    let per = per_page.max(1) as u64;
+    (((items as u64 + per - 1) / per).max(1)).min(u32::MAX as u64) as u32
+}
+
+/// 把页码夹进 `[1, total]`：筛选/搜索让结果变少时不能停在只有空白的一页上。
+fn clamp_page(current: u32, total: u32) -> u32 {
+    current.clamp(1, total.max(1))
+}
+
+/// 页码窗口：**最近 7 个**，尽量让当前页居中，两头贴边时不越界。
+///
+/// 例（7 个）：当前 1 → 1..7；当前 5 → 2..8；当前 100/200 → 97..103；当前 200 → 194..200。
+fn page_window(current: u32, total: u32) -> Vec<u32> {
+    let total = total.max(1);
+    let cur = clamp_page(current, total);
+    let want = PAGE_NUMBERS.min(total) as u32;
+    // 先按"当前页居中"算起点，再夹到 [1, total-want+1]
+    let half = want / 2;
+    let start = (cur.saturating_sub(half)).clamp(1, total - want + 1);
+    (start..start + want).collect()
+}
+
+/// 这一页在列表里是第 `[from, to)` 段（`to` 夹在长度内 ⇒ 空页给空段，不会 panic）。
+fn page_bounds(page: u32, total_items: usize, per_page: usize) -> (usize, usize) {
+    let per = per_page.max(1);
+    let pages = page_count(total_items, per);
+    let p = clamp_page(page, pages);
+    let from = ((p - 1) as usize * per).min(total_items);
+    let to = (from + per).min(total_items);
+    (from, to)
+}
+
+/// 折叠判据（纯函数）：`key` 现在**展开**吗？用户没动过 ⇒ 用 `default_open`
+/// （`Group::expanded`，现在四组都是 `true` = 默认展开）。
+fn fold_open(fold: &BTreeMap<String, bool>, key: &str, default_open: bool) -> bool {
+    fold.get(key).copied().unwrap_or(default_open)
+}
+
+/// 折叠切换（纯函数）：把 `key` 折成相反状态，返回切换**之后**是不是展开。
+/// 默认展开的组点一下 = 收起（表里记 `false`），再点一下 = 展开（表里记 `true`）。
+fn toggle_fold(fold: &mut BTreeMap<String, bool>, key: &str, default_open: bool) -> bool {
+    let now_open = !fold_open(fold, key, default_open);
+    fold.insert(key.to_string(), now_open);
+    now_open
+}
+
+/// 折叠态 → 配置行（`键=1|0`）。与筛选值用同一种写法，人眼也能读。
+fn fold_to_lines(fold: &BTreeMap<String, bool>) -> Vec<String> {
+    fold.iter()
+        .map(|(k, open)| format!("{k}={}", u8::from(*open)))
+        .collect()
+}
+
+/// 配置行 → 折叠态。**只认认识的键**（`panel` + 四个组键），坏行/陌生键一律丢掉
+/// ⇒ 以后删组（比如这次的「来源」组）不会让老配置变成脏数据。
+fn fold_from_lines(lines: &[String]) -> BTreeMap<String, bool> {
+    lines
+        .iter()
+        .filter_map(|line| {
+            let (key, val) = line.trim().split_once('=')?;
+            let open = match val.trim() {
+                "1" => true,
+                "0" => false,
+                _ => return None,
+            };
+            let key = key.trim();
+            let known =
+                key == FILTER_PANEL_KEY || workshop::GROUPS.iter().any(|g| g.key == key);
+            known.then(|| (key.to_string(), open))
+        })
+        .collect()
+}
+
+/// 「筛选」区的高度上限（窗口逻辑高度的 28%，夹在 110..380 之间）。
+///
+/// 四组默认展开后这一块很高（类型/年龄/分辨率/标签 的 chip 全铺开）；不设上限就会把
+/// 下面的缩略图网格挤没（列高被 Fill 抢走）。纯函数 ⇒ 单测直接钉边界。
+fn filter_panel_max_h(win_h: f32) -> f32 {
+    (win_h * 0.28).clamp(110.0, 380.0)
+}
+
+/// 翻页条上的一个按钮。
+///
+/// * `active` = 当前页 ⇒ 强调色实心（并且点了也不会有事：调用方发的是同一页）；
+/// * `enabled == false` ⇒ **灰且不挂消息**（真置灰：按下去什么都不发生）；
+/// * 其余 = 普通灰底小按钮，`on_press_down`（这个壳里 `on_press` 是空操作，见 we_ui）。
+fn page_button(
+    label: impl Into<String>,
+    enabled: bool,
+    active: bool,
+    msg: Message,
+) -> Element<'static, Message> {
+    let label = label.into();
+    if active {
+        return widget::button::custom(widget::text(label).size(11))
+            .class(we_ui::filled_class())
+            .padding([2, 7])
+            .on_press_down(msg)
+            .into();
+    }
+    if !enabled {
+        // 置灰 = **没有胶囊底 + 暗字**：按下去什么都不发生，视觉上和可点的药丸按钮分得开
+        return widget::container(we_ui::label(label, 11.0, we_ui::ink_dim()))
+            .padding([2, 7])
+            .into();
+    }
+    widget::button::custom(widget::text(label).size(11))
+        .class(we_ui::gray_class())
+        .padding([2, 7])
+        .on_press_down(msg)
+        .into()
+}
+
+/// 两个浏览页的差别（收在一处，免得"发现页偷偷也出筛选"这种回退）。
+///
+/// 用户 2026-10-22：**发现页 = 热度推荐、不筛选**；**工坊页 = 搜索 + 筛选**。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum BrowseSurface {
+    /// 发现页：固定 `browsesort=trend`，无筛选面板
+    Hot,
+    /// 创意工坊页：可搜索、可改排序、有筛选面板
+    Workshop,
+}
+
+impl BrowseSurface {
+    /// 标题 + 副标题（"热度推荐"必须写在界面上 —— 用户就是因为看不到文字才以为标题错了）
+    fn title(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Hot => (
+                "热度推荐",
+                "按 Steam 创意工坊热度排序（browsesort=trend）· 本页不筛选 · 点缩略图看详情",
+            ),
+            Self::Workshop => (
+                "创意工坊",
+                "关键词搜索 + 筛选（与 Win 版 WE 面板同构）· 翻页在底部单独一行",
+            ),
+        }
+    }
+
+    /// 出不出筛选面板（只有工坊页出）
+    fn shows_filter(self) -> bool {
+        matches!(self, Self::Workshop)
+    }
+
+    /// 能不能改排序（发现页钉死热度 ⇒ 不出排序按钮）
+    fn sort_editable(self) -> bool {
+        matches!(self, Self::Workshop)
+    }
+
+    /// 这一页真正发出去的 `browsesort`：发现页**恒为** `trend`
+    fn sort_key(self, sort_idx: usize) -> &'static str {
+        match self {
+            Self::Hot => workshop::SORTS[0].0,
+            Self::Workshop => workshop::SORTS[sort_idx % workshop::SORTS.len()].0,
+        }
+    }
+
+    /// 上屏用的排序名（发现页写"热度推荐"，不暴露内部枚举名）
+    fn sort_label(self, sort_idx: usize) -> &'static str {
+        match self {
+            Self::Hot => "热度推荐",
+            Self::Workshop => workshop::SORTS[sort_idx % workshop::SORTS.len()].1,
+        }
+    }
 }
 
 /// 工坊筛选的**防抖判据**（纯函数，可单测）：这条定时消息该不该放行？
@@ -8669,5 +9112,229 @@ impl menu::action::MenuAction for MenuAction {
         match self {
             MenuAction::About => Message::ToggleContextPage(ContextPage::About),
         }
+    }
+}
+
+// ── 2026-10-22 UI 五件事的单测（默认展开 / 发现页=热度 / 翻页条 / 间距）──────────
+//
+// 这些都是**纯函数**判据（界面只负责把它们画出来），所以不需要开窗口就能断言；
+// 界面上量像素的证据另存 `artifacts/ui5-20261022/`（截图 + 量尺脚本）。
+#[cfg(test)]
+mod ui5_tests {
+    use super::*;
+
+    /// ① **所有筛选组默认展开**：空表 ⇒ 每一组都开着；`toggle` 两次回到原样。
+    #[test]
+    fn every_filter_group_is_expanded_by_default() {
+        let fold: BTreeMap<String, bool> = BTreeMap::new();
+        for g in &workshop::GROUPS {
+            assert!(g.expanded, "组 {:?} 的默认值必须是「展开」", g.key);
+            assert!(
+                fold_open(&fold, g.key, g.expanded),
+                "空表 + expanded=true ⇒ {:?} 必须展开",
+                g.key
+            );
+        }
+        assert!(fold_open(&fold, FILTER_PANEL_KEY, true), "整块筛选区默认展开");
+
+        // 用户折一下 = 收起；再折一下 = 回到展开（不是"永远收起"）
+        let mut fold: BTreeMap<String, bool> = BTreeMap::new();
+        let first = toggle_fold(&mut fold, workshop::G_TAGS, true);
+        assert!(!first, "第一次点击 = 折起来");
+        assert!(!fold_open(&fold, workshop::G_TAGS, true));
+        let second = toggle_fold(&mut fold, workshop::G_TAGS, true);
+        assert!(second, "第二次点击 = 展开");
+        assert!(fold_open(&fold, workshop::G_TAGS, true));
+    }
+
+    /// ① **手动折过的状态记得住**：落盘 → 读回，折叠态一字不差（只存与默认不同的）。
+    #[test]
+    fn fold_state_survives_the_config_round_trip() {
+        let mut fold: BTreeMap<String, bool> = BTreeMap::new();
+        toggle_fold(&mut fold, FILTER_PANEL_KEY, true); // 面板收起
+        toggle_fold(&mut fold, workshop::G_RESOLUTION, true); // 分辨率收起
+        let lines = fold_to_lines(&fold);
+        assert_eq!(
+            lines,
+            vec!["panel=0".to_string(), "resolution=0".to_string()],
+            "只写用户动过的键，`键=1|0` 一行一条（BTreeMap ⇒ 键有序）"
+        );
+
+        let back = fold_from_lines(&lines);
+        assert_eq!(back, fold, "读回必须一模一样");
+        // 没动过的组仍然是展开的
+        assert!(fold_open(&back, workshop::G_TAGS, true));
+    }
+
+    /// ① 配置里的坏行/陌生组键一律丢掉（删掉「来源」组后老配置里可能还有 `source=`）。
+    #[test]
+    fn fold_lines_drop_unknown_keys_and_junk() {
+        let lines: Vec<String> = [
+            "panel=0",
+            "source=1",   // 组已经删了
+            "rating=2",   // 状态位不合法
+            "nonsense",   // 没有 =
+            "tags=1",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let fold = fold_from_lines(&lines);
+        assert_eq!(fold.len(), 2, "只留 panel/tags：{fold:?}");
+        assert_eq!(fold.get("panel"), Some(&false));
+        assert_eq!(fold.get("tags"), Some(&true));
+    }
+
+    /// ② **发现页 = 热度推荐**：`browsesort` 恒为 trend（不管用户在工作坊页选了什么），
+    /// 而且发现页**不出筛选面板**；工坊页相反。
+    #[test]
+    fn discover_surface_is_always_trend_and_has_no_filter() {
+        let hot = BrowseSurface::Hot;
+        let shop = BrowseSurface::Workshop;
+        for idx in 0..workshop::SORTS.len() {
+            assert_eq!(hot.sort_key(idx), "trend", "发现页必须钉死 trend（idx={idx}）");
+        }
+        assert_eq!(hot.sort_key(0), workshop::SORTS[0].0);
+        assert!(!hot.shows_filter(), "发现页不许有筛选面板");
+        assert!(!hot.sort_editable(), "发现页排序不可改");
+        assert!(shop.shows_filter(), "工坊页保留筛选面板");
+        assert!(shop.sort_editable(), "工坊页可改排序");
+        // 标题/副标题必须把"热度推荐"写在界面上（用户就是因为看不到文字才以为坏了）
+        let (title, sub) = hot.title();
+        assert_eq!(title, "热度推荐");
+        assert!(sub.contains("browsesort=trend"), "副标题要点明 trend：{sub}");
+    }
+
+    /// ③ **工坊页没有「来源」组**：组表里没有，词表也不再有 Official/Workshop/Local。
+    #[test]
+    fn workshop_filter_has_no_source_group() {
+        assert_eq!(workshop::GROUPS.len(), 4, "类型/年龄分级/分辨率/标签");
+        assert!(
+            !workshop::GROUPS.iter().any(|g| g.key == "source"),
+            "「来源」组必须已删除"
+        );
+        for t in ["Official", "Workshop", "Local"] {
+            assert!(
+                !workshop::is_real_tag("source", t),
+                "{t} 不该再是真标签（来源组已删）"
+            );
+        }
+    }
+
+    /// ④ 翻页：总页数 / 页码夹取 / **最近 7 个**页码窗口。
+    #[test]
+    fn page_count_clamps_and_always_has_one_page() {
+        assert_eq!(page_count(0, PAGE_SIZE), 1, "空列表也是 1 页");
+        assert_eq!(page_count(1, PAGE_SIZE), 1);
+        assert_eq!(page_count(PAGE_SIZE, PAGE_SIZE), 1, "正好一页");
+        assert_eq!(page_count(PAGE_SIZE + 1, PAGE_SIZE), 2);
+        assert_eq!(page_count(PAGE_SIZE * 3, PAGE_SIZE), 3);
+        assert_eq!(clamp_page(5, 3), 3, "超出总数 ⇒ 夹到最后一页");
+        assert_eq!(clamp_page(0, 3), 1, "0 页不存在");
+    }
+
+    #[test]
+    fn page_window_is_the_nearest_seven_numbers() {
+        // 总数足够：始终 7 个、连续、包含当前页
+        assert_eq!(page_window(1, 100), vec![1, 2, 3, 4, 5, 6, 7], "首页贴左边");
+        assert_eq!(page_window(2, 100), vec![1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(page_window(5, 100), vec![2, 3, 4, 5, 6, 7, 8], "当前页居中");
+        assert_eq!(page_window(50, 100), vec![47, 48, 49, 50, 51, 52, 53]);
+        assert_eq!(page_window(100, 100), vec![94, 95, 96, 97, 98, 99, 100], "尾页贴右边");
+        // 总数不够 7 页 ⇒ 有多少画多少
+        assert_eq!(page_window(1, 3), vec![1, 2, 3]);
+        assert_eq!(page_window(2, 3), vec![1, 2, 3]);
+        assert_eq!(page_window(1, 1), vec![1]);
+        for cur in [1u32, 3, 7, 42, 99, 100] {
+            let w = page_window(cur, 100);
+            assert_eq!(w.len(), PAGE_NUMBERS as usize);
+            assert!(w.contains(&cur));
+            assert!(w.windows(2).all(|p| p[1] == p[0] + 1), "必须连续：{w:?}");
+        }
+    }
+
+    #[test]
+    fn page_bounds_slice_the_list_without_panicking() {
+        assert_eq!(page_bounds(1, 0, PAGE_SIZE), (0, 0), "空列表");
+        assert_eq!(page_bounds(1, 5, PAGE_SIZE), (0, 5));
+        assert_eq!(page_bounds(2, 31, PAGE_SIZE), (30, 31), "第二页只剩 1 条");
+        assert_eq!(
+            page_bounds(3, 31, PAGE_SIZE),
+            (30, 31),
+            "越界页夹到最后一页（不出现空白页）"
+        );
+        assert_eq!(page_bounds(99, 0, PAGE_SIZE), (0, 0), "空列表 + 越界页也不 panic");
+        assert_eq!(page_bounds(0, 31, PAGE_SIZE), (0, 30), "0 页夹到第 1 页");
+    }
+
+    /// ④ **三个页都画底部翻页条**，而且用的是同一套控件（`view_page_bar`）。
+    /// 源码级断言（这里点不动界面）：`view_wallpapers` / `view_browse` 各有一处调用，
+    /// 加上函数定义本身 = 3 处；工坊页的翻页**不在**工具栏里（原来的 `page_txt` 已删）。
+    #[test]
+    fn all_three_pages_draw_the_bottom_page_bar() {
+        let src = include_str!("app.rs");
+        let code = src.split("mod ui5_tests {").next().unwrap_or("");
+        let calls = code.matches("self.view_page_bar(").count();
+        assert_eq!(calls, 2, "已安装页 + 浏览页各一处调用（工坊/发现共用浏览页）");
+        assert!(
+            !code.contains("page_txt"),
+            "工具栏里那个「第 N 页 →」按钮必须已经删掉（翻页只在底部那一行）"
+        );
+        // 翻页控件的名字/顺序在这一处钉死（顺序 = 用户要求的 首页 / 上一页 / 7 个页码 / 下一页 / 尾页）
+        let mut last = 0usize;
+        for label in ["⏮ 首页", "◀ 上一页", "下一页 ▶", "尾页 ⏭"] {
+            let at = code
+                .find(&format!("\"{label}\""))
+                .unwrap_or_else(|| panic!("翻页条缺控件：{label}"));
+            assert!(at > last, "翻页控件顺序不对：{label} 应在上一项之后");
+            last = at;
+        }
+    }
+
+    /// ① 补救：四组默认展开后，筛选面板必须有**高度上限**，否则把缩略图网格挤成 0 高。
+    #[test]
+    fn filter_panel_height_is_capped() {
+        assert!((filter_panel_max_h(900.0) - 252.0).abs() < 0.01, "900 高 ⇒ 28%");
+        assert!((filter_panel_max_h(560.0) - 156.8).abs() < 0.01, "最小窗口也跟着缩");
+        assert_eq!(filter_panel_max_h(200.0), 110.0, "下界 110（再矮就只剩网格了）");
+        assert_eq!(filter_panel_max_h(2400.0), 380.0, "上界 380（大屏也不无限长）");
+    }
+
+    /// ⑤ 壁纸图（预览/宣传图）与属性控件之间 ≥ 12px —— 常量与两处间距都在这里钉死。
+    #[test]
+    fn preview_gap_is_at_least_12() {
+        assert!(
+            PREVIEW_GAP >= 12.0,
+            "用户要求至少 12–16px，现在是 {PREVIEW_GAP}"
+        );
+        assert!(PREVIEW_GAP >= 16.0, "取 16（用户给的上限，也是我们的默认）");
+        assert!(
+            HEADER_GAP >= 12.0,
+            "工具栏/「尺寸」滑杆与缩略图之间也要 ≥12px，现在是 {HEADER_GAP}"
+        );
+
+        // 光有常量不算数：**两处**都得真的把这段空白 push 进去
+        //   ① `view_detail`：顶部大预览图下面
+        //   ② `view_promo`：作者宣传图（属性区里的"壁纸图"）下面是作者的滑动条/输入框
+        let src = include_str!("app.rs");
+        let code = src.split("mod ui5_tests {").next().unwrap_or("");
+        let detail = code
+            .split("fn view_detail(")
+            .nth(1)
+            .and_then(|rest| rest.split("\n    fn ").next())
+            .unwrap_or("");
+        assert!(
+            detail.contains("PREVIEW_GAP"),
+            "view_detail 里预览图下面必须垫 PREVIEW_GAP"
+        );
+        let promo = code
+            .split("fn view_promo")
+            .nth(1)
+            .and_then(|rest| rest.split("\n    fn ").next())
+            .unwrap_or("");
+        assert!(
+            promo.contains("PREVIEW_GAP"),
+            "view_promo 里宣传图下面必须垫 PREVIEW_GAP（否则作者滑动条会贴着图）"
+        );
     }
 }

@@ -84,8 +84,10 @@ pub struct Config {
     /// 所以标签表以后增删都不会让这里变成"发了却永远筛不到东西"的脏数据。
     /// 用户要求"重启/切页后筛选状态保留" ⇒ 每次防抖放行时写回。
     pub workshop_filter_state: Vec<String>,
-    /// 工坊页那个「筛选」区是否展开（收起/展开也记住，重启后还原）。
-    pub workshop_filter_open: bool,
+    /// 工坊页筛选的**折叠态**：`键 = 是否展开`（`panel` = 整个「筛选」区，其余是组键）。
+    /// 写法与筛选值一致（`key=1|0` 一行一条），**只存与默认值不同的键** ⇒
+    /// 用户亲手折过的重启后仍然折着，没动过的跟着默认（现在全是展开，见 `Group::expanded`）。
+    pub workshop_fold: Vec<String>,
 }
 
 /// 手写 `Default`（**不能**再 derive）：`show_promo` 的默认值要是 `true`
@@ -109,9 +111,10 @@ impl Default for Config {
             auto_apply_last: true,
             // 空表 = 默认根目录 `~/Templates`（见 `wp::library::default_roots`）。
             library_dirs: Vec::new(),
-            // 工坊筛选默认不筛、默认收起（第一次进工坊页看到的是"趋势"而不是空结果）。
+            // 工坊筛选默认不筛；「筛选」区与各组**默认全部展开**（旧版这里默认收起，
+            // 一进工坊页只剩「仅显示」一行 —— 用户 2026-10-22 明确要求默认展开）。
             workshop_filter_state: Vec::new(),
-            workshop_filter_open: false,
+            workshop_fold: Vec::new(),
         }
     }
 }

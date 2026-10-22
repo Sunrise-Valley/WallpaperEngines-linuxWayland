@@ -114,7 +114,8 @@ pub const SORTS: [(&str, &str); 4] = [
 //
 // 词表与语义**不是猜的**：来源 `artifacts/we-ui-filters-20261022/`（Win 版 WE 的明文
 // AngularJS 面板 `ui/dist/scripts/scripts.js` + `bin/wallpaperui.exe` 的 `.rdata` 指针表：
-// 6 组、真实 tag 值、默认值、查询语义全在里面，单测 `filter_matches_reversed_spec`
+// 6 组、真实 tag 值、默认值、查询语义全在里面（本仓界面渲染 4 组：来源组已按
+// 用户要求删掉，「仅显示」单独实现），单测 `filter_matches_reversed_spec`
 // 直接读那份 JSON 逐组对比）。要点：
 //
 // * **勾选 = 不排除**（不是"必须有"）；**未勾的**才进 `excludedtags[]`
@@ -181,9 +182,12 @@ pub struct Group {
     /// 持久化用的键（`type:Application=0` 的前半段）。**改名会让老配置失效**，别动。
     pub key: &'static str,
     pub title: &'static str,
-    /// 默认收起？（类型 / 年龄分级 / 分辨率收起；来源 / 标签展开 ——
-    /// WE 里这两类组的 `ng-show` / `ng-hide` 约定相反，别"统一"掉。）
-    pub collapsed: bool,
+    /// **默认展开吗？**（2026-10-22 用户要求：所有分组默认展开 —— 原来
+    /// 类型/年龄分级/分辨率默认收起，一进工坊页只看得到「仅显示」一行，用户误以为
+    /// 标题错了。字段从 `collapsed` 改名成 `expanded`，语义反过来，免得下一个人
+    /// 又把 `false` 读成"折叠"。用户手动折起来的状态记在
+    /// `AppModel::filter_collapsed` / `Config::workshop_collapsed`，与这里无关。）
+    pub expanded: bool,
     /// 组级"所有 / 无"（只有"标签"组有；分辨率是每个子组各一对）
     pub all_none: bool,
     pub sections: &'static [Section],
@@ -196,16 +200,20 @@ pub struct Group {
 pub const G_TYPE: &str = "type";
 pub const G_RATING: &str = "rating";
 pub const G_RESOLUTION: &str = "resolution";
-pub const G_SOURCE: &str = "source";
 pub const G_TAGS: &str = "tags";
 
-/// 四个"黑名单"组 + 一个纯本地组。**没有**"仅显示"组：它不是黑名单
+/// 四个"黑名单"组。**没有**"仅显示"组：它不是黑名单
 /// （勾上 = 进 `requiredtags[]` / 额外排除），单独用 [`SHOW_ONLY`] 表示。
-pub const GROUPS: [Group; 5] = [
+///
+/// **「来源」组已删**（2026-10-22 用户要求：Official/Workshop/Local 对这套只有
+/// 浏览+属性的界面没有意义）。它原来是纯本地组（`query_backed == false`），
+/// 不进任何查询参数 ⇒ 删掉不影响 Steam 请求；配置里残留的 `source:*` 行会被
+/// [`Filter::from_lines`] 当成"组不在词表里"丢掉。
+pub const GROUPS: [Group; 4] = [
     Group {
         key: G_TYPE,
         title: "类型",
-        collapsed: true,
+        expanded: true,
         all_none: false,
         query_backed: true,
         note: "勾选 = 不排除。Application 在 WE 的工坊浏览页被隐藏、默认不勾",
@@ -236,7 +244,7 @@ pub const GROUPS: [Group; 5] = [
     Group {
         key: G_RATING,
         title: "年龄分级",
-        collapsed: true,
+        expanded: true,
         all_none: false,
         query_backed: true,
         note: "默认只勾「大众级」⇒ PG-13 / R-18 默认被排除（= WE 默认）",
@@ -256,7 +264,7 @@ pub const GROUPS: [Group; 5] = [
     Group {
         key: G_RESOLUTION,
         title: "分辨率",
-        collapsed: true,
+        expanded: true,
         all_none: false,
         query_backed: true,
         note: "5 个宽高比子组各带「所有/无」；末尾两项不属于任何子组（默认全勾）",
@@ -343,31 +351,9 @@ pub const GROUPS: [Group; 5] = [
         ],
     },
     Group {
-        key: G_SOURCE,
-        title: "来源",
-        collapsed: false,
-        all_none: false,
-        // WE 里这一组用 `ng-hide="filterHideSource"`（变量为真 = 收起），初始 undefined
-        // ⇒ **展开**；而且只在"已安装"源出现。
-        query_backed: false,
-        note: "只对「已安装」项有意义（WE：工坊浏览页整组隐藏）⇒ 本页不发查询参数",
-        sections: &[Section {
-            key: "source",
-            title: "",
-            all_none: false,
-            all_none_skip: "",
-            new_unit: true,
-            opts: &[
-                Opt::on("Official", "官方"),
-                Opt::on("Workshop", "创意工坊"),
-                Opt::on("Local", "我的壁纸"),
-            ],
-        }],
-    },
-    Group {
         key: G_TAGS,
         title: "标签",
-        collapsed: false,
+        expanded: true,
         all_none: true,
         query_backed: true,
         note: "25 个真实风格标签（`Unspecified` 排在末尾，WE 也是这么挪的）",
@@ -2196,18 +2182,19 @@ mod tests {
     // 指针表拓下来的规格），**用另一套独立实现**从 JSON 推出应有的标签集合，再和
     // 我们生成的 URL 逐组比对。下面那些用例是手感/回归，不承担"和规格一致"的证明。
 
-    /// 六组结构：顺序、小节、选项数、**默认值**都照抄规格（`filters.json`）。
+    /// 组结构：顺序、小节、选项数、**默认值**都照抄规格（`filters.json`）。
     #[test]
     fn filter_groups_match_we_panel_layout() {
         let keys: Vec<&str> = GROUPS.iter().map(|g| g.key).collect();
         assert_eq!(
             keys,
-            vec![G_TYPE, G_RATING, G_RESOLUTION, G_SOURCE, G_TAGS],
-            "组顺序 = WE 面板顺序（仅显示组单独表示）"
+            vec![G_TYPE, G_RATING, G_RESOLUTION, G_TAGS],
+            "组顺序 = WE 面板顺序（仅显示组单独表示；来源组已按用户要求删掉）"
         );
-        // 折叠默认值：类型/年龄分级/分辨率**收起**，来源/标签**展开**
-        let collapsed: Vec<bool> = GROUPS.iter().map(|g| g.collapsed).collect();
-        assert_eq!(collapsed, vec![true, true, true, false, false]);
+        // 折叠默认值：**四组全部默认展开**（用户 2026-10-22：一进工坊页就该看到全部筛选项，
+        // 而不是只剩「仅显示」一行）。用户手动折过的记在 AppModel/Config，不在这里。
+        let expanded: Vec<bool> = GROUPS.iter().map(|g| g.expanded).collect();
+        assert_eq!(expanded, vec![true, true, true, true], "所有分组默认展开");
 
         // 类型组：两个小节（typetags / categorytags），Application 在工坊默认**不勾**
         let ty = GROUPS.iter().find(|g| g.key == G_TYPE).unwrap();
@@ -2241,10 +2228,14 @@ mod tests {
         assert!(tg.all_none, "标签组在组头上有「所有/无」");
         assert!(tg.sections[0].all_none_skip == "Unspecified", "所有/无 跳过 Unspecified");
 
-        // 来源组：纯本地（不发查询参数）；WE 里它只在"已安装"源出现
-        let src = GROUPS.iter().find(|g| g.key == G_SOURCE).unwrap();
-        assert!(!src.query_backed);
-        assert_eq!(group_opts(G_SOURCE).count(), 3);
+        // 来源组已删（用户 2026-10-22：Official/Workshop/Local 没有意义）——
+        // 它曾经是唯一 `query_backed == false` 的组，现在**不存在**了，
+        // 所以"纯本地面板里有个组不参与查询"这条路径也一起消失。
+        assert!(
+            !GROUPS.iter().any(|g| g.key == "source" || g.title == "来源"),
+            "工坊页不应再有「来源」组"
+        );
+        assert!(GROUPS.iter().all(|g| g.query_backed), "剩下的组都进查询参数");
     }
 
     /// **默认状态 = WE 默认筛选**：排除 Application / Questionable / Mature / Unspecified，
