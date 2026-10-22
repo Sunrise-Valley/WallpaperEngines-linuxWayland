@@ -100,6 +100,7 @@ install -m 0644 crates/wallpaper-hub/resources/icons/hicolor/scalable/apps/icon.
 # Docs required by policy (§12.5): copyright + upstream docs.
 install -m 0644 README.md       "$STAGE/usr/share/doc/$PKG/README.md"
 install -m 0644 ARCHITECTURE.md "$STAGE/usr/share/doc/$PKG/ARCHITECTURE.md"
+install -m 0644 CHANGELOG.md    "$STAGE/usr/share/doc/$PKG/CHANGELOG.md"
 install -m 0644 packaging/copyright "$STAGE/usr/share/doc/$PKG/copyright"
 chmod 0644 "$STAGE/usr/share/doc/$PKG/"*
 

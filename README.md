@@ -17,6 +17,9 @@ subscribe, does not download anything, and does not need Steam installed at all.
 scene wallpapers from plain directories on your disk — see
 [Where wallpapers come from](#where-wallpapers-come-from).
 
+**Version:** 0.1.0 · **Changelog:** [CHANGELOG.md](CHANGELOG.md) — what changed, and the
+`libc6` caveat for the prebuilt package.
+
 ---
 
 ## Where wallpapers come from
@@ -269,7 +272,7 @@ What lands where:
 | `/usr/lib/systemd/user/wallpaper-hub.service` | UI unit, pulls in the kernel unit |
 | `/usr/share/applications/io.github.wallpaperhub.WallpaperHub.desktop` | launcher entry |
 | `/usr/share/icons/hicolor/scalable/apps/io.github.wallpaperhub.WallpaperHub.svg` | icon |
-| `/usr/share/doc/wallpaper-hub/` | `README.md`, `ARCHITECTURE.md`, `copyright` |
+| `/usr/share/doc/wallpaper-hub/` | `README.md`, `ARCHITECTURE.md`, `CHANGELOG.md`, `copyright` |
 
 Both units are `WantedBy=graphical-session.target`, so enabling them once is enough —
 they reconnect on every login. `wallpaper-hub.service` starts the kernel too; you can
