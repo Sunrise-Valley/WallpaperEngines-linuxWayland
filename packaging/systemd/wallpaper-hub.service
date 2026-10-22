@@ -10,8 +10,11 @@ Wants=wallpaper-native-kernel.service
 [Service]
 Type=simple
 ExecStart=/usr/bin/wallpaper-hub
+# Closing the window is a normal exit, not a crash: on-success must stay off so
+# closing the UI never respawns it. Only a non-zero exit (or a signal) restarts.
 Restart=on-failure
 RestartSec=3
+SuccessExitStatus=0
 Slice=session.slice
 
 [Install]

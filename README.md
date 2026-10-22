@@ -276,7 +276,16 @@ they reconnect on every login. `wallpaper-hub.service` starts the kernel too; yo
 enable just the kernel (`systemctl --user enable --now wallpaper-native-kernel.service`)
 if you prefer to open the UI by hand.
 
-Rebuild the package from source (no sudo, no `/tmp`, output in `dist/`):
+Restart policy differs on purpose. `wallpaper-hub.service` is `Restart=on-failure` with
+`SuccessExitStatus=0`, so **closing the window is a clean exit and is not respawned**;
+only a crash (non-zero exit or signal) is restarted. `wallpaper-native-kernel.service` is
+also `Restart=on-failure`, but there a non-zero exit is always real trouble — the renderer
+watchdog exits non-zero when it wedges — so a crashed kernel is pulled back up.
+
+Rebuild the package from source (no sudo, no `/tmp`, output in `dist/`). Use this for an
+older `.deb` from a previous release, or on any distribution whose `libc6`/Wayland/ffmpeg
+sonames differ from the build host's: the script recompiles both binaries and recomputes
+`Depends` on the machine you run it on, so the result matches your system.
 
 ```sh
 ./packaging/build-deb.sh             # build both binaries, then dpkg-deb

@@ -18,6 +18,13 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
+# A stale LD_LIBRARY_PATH (a private GL/ffmpeg sysroot, a self-built libwayland)
+# leaks into the link step: the binaries then record sonames nothing owns, or a
+# RUNPATH into $HOME, and dpkg-shlibdeps cannot map them to a Debian package —
+# Depends comes out wrong or empty. Packages must link against system libraries,
+# so the variable is dropped here rather than trusted from the caller's shell.
+unset LD_LIBRARY_PATH LD_PRELOAD
+
 PKG=wallpaper-hub
 ARCH="${ARCH:-amd64}"
 VERSION="${VERSION:-$(awk -F'"' '/^version = /{print $2; exit}' crates/wallpaper-hub/Cargo.toml)}"
