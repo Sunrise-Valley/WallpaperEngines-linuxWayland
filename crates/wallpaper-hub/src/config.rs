@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: GPL-3.0-only
 
 use cosmic::cosmic_config::{self, CosmicConfigEntry, cosmic_config_derive::CosmicConfigEntry};
 use std::collections::BTreeMap;
@@ -16,20 +16,23 @@ pub struct Config {
     pub perf_preset: String,
     /// 下面**三项**是"高级"里的逐项值；档位只是给它们一组预设
     /// （内核侧是纯机制、无状态 ⇒ 界面发什么它就执行什么）。
-    /// ⚠ **帧率不在这里了**。它以前是这个结构体里的一个全局 `fps: u64`，
+    ///
+    /// ⚠ 2026-10-14：**帧率不在这里了**。它以前是这个结构体里的一个全局 `fps: u64`，
     /// 于是"每次应用壁纸都下发同一个数" —— 重场景被卡在 30、轻场景也上不去 60，
     /// 用户看到的就是"跟手慢 / 延迟太高"。现在 fps 是**逐场景**的
     /// （见 [`fps_for_scene`] 与 `~/.local/share/wallpaper-hub/scene_fps.json`），
     /// 默认 60、可按场景钉 30。旧的 `fps` 键（`~/.config/cosmic/…/v1/fps`）
-    /// 从本次起**不被读取也不再写入** —— 老机器上那个 30 不会覆盖任何东西。
+    /// 从本轮起**不被读取也不再写入** —— 老机器上那个 30 不会覆盖任何东西。
     pub render_scale: String,
     /// `all` / `none`
     pub effects: String,
     /// `never` / `fullscreen` / `maximized`
     pub sleep_mode: String,
-    /// 后端选择：`true` = 自研内核（`we-native`）。保留此键只为兼容旧配置；
-    /// 旧的外部 daemon 后端已整体移除，`false` 现在没有对应的后端可用，
-    /// 因此默认值取 `true`（否则新装用户点「应用」不会有任何反应）。
+    /// 后端选择：`true` = 自研内核（we-native），`false` = waywallen。
+    ///
+    /// 必须持久化：默认值 `false`（waywallen）意味着"每次开界面都回 waywallen"——
+    /// 而 waywallen 的 daemon 重启后不会自动起来（瞬态服务）⇒ 用户会看到"未连接 + 列表空"，
+    /// 哪怕自研内核好好地在跑。用户选过一次就该记住。
     pub backend_native: bool,
     /// 取景模式（scene 壁纸的画布比例 ≠ 屏幕比例时怎么放）：
     /// `cover`（默认，铺满裁边）/ `stretch`（拉伸）/ `center`（1:1 居中）/ `contain`（整张留黑）。
@@ -37,24 +40,27 @@ pub struct Config {
     pub fit_mode: String,
     /// 画面色彩调整：`"亮度,对比度,饱和度,色相,色温,伽马"`（六个浮点的字符串）。
     /// 单位值 `1,1,1,0,0,1`（= 不做任何处理，走原来那条 shader ⇒ 零开销）。
-    /// ⚠ 起它只是**旧的全局值**：真正生效的是 [`Config::color_by_id`]
+    ///
+    /// ⚠ 2026-10-12 起它只是**旧的全局值**：真正生效的是 [`Config::color_by_id`]
     /// （按壁纸 id 分槽）。这里保留是为了**兼容与迁移** —— 分槽表里没有某条壁纸时，
     /// 用这个值当它的默认（老用户之前调过的全局色彩不会丢）。
     pub color: String,
     /// **按壁纸 id 分槽的画面色彩**：id → `"亮度,对比度,饱和度,色相,色温,伽马"`。
-    /// 切到哪条壁纸就下发它自己那一份；切回来时恢复（色彩调整按壁纸生效，不是全局）。
-    /// 某条没记录时退回 [`Config::color`]，再没有就是
+    ///
+    /// 切到哪条壁纸就下发它自己那一份；切回来时恢复（用户要求「色彩调整不要全局生效，
+    /// 而是针对那一个壁纸」）。某条没记录时退回 [`Config::color`]，再没有就是
     /// [`COLOR_IDENTITY`]。存的是**中性值**时不写进表（等于没有覆盖）。
     pub color_by_id: BTreeMap<String, String>,
     /// 详情面板是否显示作者嵌在工程文件里的**宣传图**（`general.properties[*].text` /
     /// `description` 里嵌的图片引用，见 `promo` 模块）。
-    /// **默认 `true` = 显示**。
+    ///
+    /// **默认 `true` = 显示**（用户 2026-10-12 拍板「放回来吧，别去除了。或者默认展示」）。
     /// 那批图是作者写死的外链（实测全是 `i.ibb.co`），显示意味着本程序主动对外发起请求，
     /// 所以**保留开关**：关掉后既不显示、也不发任何请求（缓存仍在
     /// `~/.cache/wallpaper-hub/promo/`，按 URL 哈希）。
     pub show_promo: bool,
     /// 连上内核时是否允许**自动推进「上次应用」**那条壁纸。
-///
+    ///
     /// ⚠ 它**永远不换掉内核正在播的那条** —— 内核是它那一层壁纸的权威（内核自己也做
     /// 启动恢复）。只有内核**空闲**（没内容 / 没在播）时才会把"上次应用"补上。
     /// 默认 `true` = "内核空闲时补一条（不乱换）"；要**彻底关掉**这种自动同步：
@@ -67,11 +73,24 @@ pub struct Config {
     /// `~/.local/share/wallpaper-hub/library_dirs`，常驻内核读那一份 ⇒ 这里改完，
     /// 内核不用重启也能按 id 找到新位置。环境变量 `WPHUB_LIBRARY_DIRS` 会整体覆盖本项。
     pub library_dirs: Vec<String>,
+    /// **工坊页筛选里"与默认值不同"的那些项**（一行一个 `组键:标签=1|0`，1 = 勾选；
+    /// 例：`type:Application=1`、`tags:Anime=0`、`only:approved=1`）。空表 = WE 默认筛选。
+    ///
+    /// 为什么只写差异：默认值本身就有"默认不勾"的项（Application / Questionable /
+    /// Mature / Unspecified）—— 全量存"勾选表"表达不了"把默认不勾的勾上"，全量存"未勾表"
+    /// 又表达不了反向那一半；差异表两边都能表达，而且将来改默认值时老配置自然跟着走。
+    /// 标签**只能**来自 [`crate::wp::workshop::GROUPS`]（Steam 标签原文）；
+    /// 读的时候会丢掉不认识的组/标签（`workshop::Filter::from_lines`），
+    /// 所以标签表以后增删都不会让这里变成"发了却永远筛不到东西"的脏数据。
+    /// 用户要求"重启/切页后筛选状态保留" ⇒ 每次防抖放行时写回。
+    pub workshop_filter_state: Vec<String>,
+    /// 工坊页那个「筛选」区是否展开（收起/展开也记住，重启后还原）。
+    pub workshop_filter_open: bool,
 }
 
 /// 手写 `Default`（**不能**再 derive）：`show_promo` 的默认值要是 `true`
 /// （宣传图默认展示），而 derive 出来的 bool 默认是 `false`。
-/// `CosmicConfigEntry` 的 `get_entry` 内部就是 `Self::default` 打底，
+/// `CosmicConfigEntry` 的 `get_entry` 内部就是 `Self::default()` 打底，
 /// 所以磁盘上没有这个键时拿到的就是这里的值。
 impl Default for Config {
     fn default() -> Self {
@@ -81,7 +100,7 @@ impl Default for Config {
             render_scale: String::new(),
             effects: String::new(),
             sleep_mode: String::new(),
-            backend_native: true,
+            backend_native: false,
             fit_mode: String::new(),
             color: String::new(),
             color_by_id: BTreeMap::new(),
@@ -90,6 +109,9 @@ impl Default for Config {
             auto_apply_last: true,
             // 空表 = 默认根目录 `~/Templates`（见 `wp::library::default_roots`）。
             library_dirs: Vec::new(),
+            // 工坊筛选默认不筛、默认收起（第一次进工坊页看到的是"趋势"而不是空结果）。
+            workshop_filter_state: Vec::new(),
+            workshop_filter_open: false,
         }
     }
 }
@@ -114,7 +136,8 @@ pub fn color_default(cfg: &Config) -> &str {
 }
 
 /// 三档预设：低配调低、高配调高（用户选的形状）。**只管三项**（渲染尺寸/特效/睡眠）：
-/// 帧率从 起是**逐场景**的，不再由档位统一钉死
+/// 帧率从 2026-10-14 起是**逐场景**的，不再由档位统一钉死
+/// （旧档位把 fps 一起改 ⇒ 每次应用都覆盖掉场景自己的选择，那正是"跟手慢"的病根）。
 pub const PRESET_POWERSAVE: (&str, &str, &str, &str) = ("powersave", "logical", "none", "maximized");
 pub const PRESET_BALANCED: (&str, &str, &str, &str) = ("balanced", "physical", "all", "fullscreen");
 pub const PRESET_QUALITY: (&str, &str, &str, &str) = ("quality", "physical", "all", "never");
@@ -184,11 +207,12 @@ pub fn effective(cfg: &Config) -> (String, String, String) {
     (scale, effects, sleep)
 }
 
-// ── 逐场景帧率────────────────────────────────────────────────
+// ── 逐场景帧率（2026-10-14）────────────────────────────────────────────────
+//
 // 实测（本机 AMD Renoir 核显 —— APU，与 CPU 共享内存带宽）：
-// · 重场景 3571777169（原生 3840x2160 + 95 条特效趟）：目标 30 ⇒ 实际 30.4fps / GPU 94%；
-// 目标 60 ⇒ 只 32.3fps / GPU 98%（上不去）⇒ **这类场景 60 反而更差**。
-// · 轻场景 2564205376（崩坏3 X-Ray）：目标 60 ⇒ 实际 62.8fps / GPU 84% ⇒ **完全跑得动**。
+//   · 重场景 3571777169（原生 3840x2160 + 95 条特效趟）：目标 30 ⇒ 实际 30.4fps / GPU 94%；
+//     目标 60 ⇒ 只 32.3fps / GPU 98%（上不去）⇒ **这类场景 60 反而更差**。
+//   · 轻场景 2564205376（崩坏3 X-Ray）：目标 60 ⇒ 实际 62.8fps / GPU 84% ⇒ **完全跑得动**。
 // ⇒ "一个固定帧率"对两边都不对：重场景要 30、轻场景要 60。
 // 所以帧率**按场景记**：默认 60（跟手），用户可对某条场景钉 30（重场景 GPU 会满）；
 // 逐场景表里没有记录 = **自适应档**（先 60 跑，实测持续明显跑不到就自动降到 30 并告知用户）。
@@ -211,7 +235,8 @@ pub const SCENE_FPS_MAX: u64 = 120;
 /// 低于 [`ADAPT_FLOOR_FPS`] 的不算 —— 那是"几乎没在画"（视频播完了 / 没内容），不是"跑不到"，
 /// 不然会误把静止画面判成"重场景"。
 ///
-/// ## 不许再把**外部负载**当成**场景能力上限**
+/// ## 2026-10-15：不许再把**外部负载**当成**场景能力上限**
+///
 /// 实测事故（journal 原文；当时用户在看的轻场景 X-Ray `2564205376`，**低载实测 62.8fps / GPU 84%**，
 /// 也就是"完全跑得动 60"）：
 /// ```text
@@ -223,10 +248,8 @@ pub const SCENE_FPS_MAX: u64 = 120;
 /// 降档把延迟加倍，与用户诉求（"要跟手"）**相反**。三条修法（都有单测钉住）：
 ///
 /// 1. **先看机器有没有别的负载**：[`external_load`]（`/proc/loadavg`）判为真 ⇒ 这条实测值反映的是
-/// "别人在抢机器"⇒ **整个观测丢掉、不判定**（既不 +1 也不清零）；
-///
+///    "别人在抢机器"⇒ **整个观测丢掉、不判定**（既不 +1 也不清零）；
 /// 2. **显著放宽**：`FAIL 50 → 40`、`STREAK 3 → 6`（≈ 18 秒）—— 只有**持续**跑不到才动手；
-///
 /// 3. **降档可恢复**：[`adapt_should_upgrade`] 满足 ⇒ **升回 60**（同样出声）。
 ///
 /// **核心原则不变**：降档必须说话（日志 + 界面），用户钉过/手选过的场景一个字都不动。
@@ -241,13 +264,12 @@ pub const ADAPT_FLOOR_FPS: f64 = 10.0;
 pub const ADAPT_FAIL_STREAK: u8 = 6;
 
 /// 「稳定地跑不到」的判据：连击窗口里实测值的 **max − min** 不许超过这个数（fps）。
-/// 依据（本机实测，）：
 ///
+/// 依据（本机实测，2026-10-15）：
 /// * 真重场景 `3571777169`（目标 60）实测 `29.7 32.1 31.5 30.8 31.2 30.4` ⇒ 极差 **2.4**
-/// （瓶颈就是它自己，帧率被自己的工作量钉住，很稳）；
-///
+///   （瓶颈就是它自己，帧率被自己的工作量钉住，很稳）；
 /// * **别人在抢 GPU** 的那 36 秒（轻场景 `2564205376`，另一个渲染器把 GPU 顶到 99%）实测
-/// `28.5 27.2 26.9 38.3 28.1 27.6 28.6` ⇒ 极差 **11.4**（外部负载忽强忽弱，帧率跟着跳）。
+///   `28.5 27.2 26.9 38.3 28.1 27.6 28.6` ⇒ 极差 **11.4**（外部负载忽强忽弱，帧率跟着跳）。
 /// ⇒ 8.0 落在两者之间：**忽高忽低的"跑不到"不算能力上限**，只有稳定地跑不到才降档。
 pub const ADAPT_PLATEAU_SPREAD: f64 = 8.0;
 /// GPU 打满时升回冷却的倍数：GPU 打满**可能是**这条场景真重，也可能**是别人在占 GPU**（读不到按进程
@@ -490,6 +512,8 @@ impl FpsSource {
 ///
 /// ① 逐场景表里有（且 > 0）⇒ 用它（来源 = [`FpsSource::SceneTable`]）；
 /// ② 没有 ⇒ 新默认 [`SCENE_FPS_DEFAULT`]（来源 = [`FpsSource::Default`]）。
+///
+/// **绝不**退回"全局固定档" —— 那正是"每次应用都被静默盖成 30"的病根。
 /// `id` 为 `None`（还没选中 / 没在播）时按默认算：宁可给 60，也不给一个假的"用户档"。
 pub fn fps_for_scene(table: &BTreeMap<String, u64>, id: Option<&str>) -> (u64, FpsSource) {
     if let Some(id) = id
@@ -534,7 +558,8 @@ pub fn scene_fps_label(fps: u64, src: FpsSource) -> String {
 // 这些不是"用户偏好"，是**机制**参数：发现页唯一的耗时来源是 Steam 的公开接口和它的图片 CDN，
 // 所以数值由实测决定（实测记录见 `wp/workshop.rs` 的模块注释）。集中放这里是为了：
 // 一处可见、可单测、改一个数就能试。
-// 实测（本机家宽，30 条/页）：搜索页 1.75s、30 条详情一次请求 1.9s、
+//
+// 实测（2026-10-12，本机家宽，30 条/页）：搜索页 1.75s、30 条详情一次请求 1.9s、
 // 缩略图单张串行 1~4s（CDN 建连占大头，波动很大）⇒ 24 张串行 = 26~95s，这就是"首次加载要等一两分钟"的来源。
 
 /// 缩略图并发下载数。实测 24 张：并发 12 → **2.65s**，并发 8 → 5.28s，并发 16 → 7.29s（CDN 侧开始限速）。
@@ -575,6 +600,11 @@ pub const WS_CACHE_MAX_ENTRIES: usize = 800;
 pub const WS_CACHE_MAX_BYTES: u64 = 256 * 1024 * 1024;
 /// 单张缩略图最大字节（异常/被投毒的响应不许吃内存）。
 pub const WS_THUMB_MAX_BYTES: u64 = 8 * 1024 * 1024;
+/// 筛选变化的防抖窗口（毫秒）：用户连点 / 连续勾选时**只发最后一次**。
+///
+/// 300ms 是用户明确要求的；比逐次点击即打网络强得多（一次 browse 1.75s，5 次点击
+/// 就是 9s + 5 倍 Steam 压力），又不至于让人等半天才看到结果。
+pub const WS_FILTER_DEBOUNCE_MS: u64 = 300;
 
 #[cfg(test)]
 mod tests {
@@ -603,13 +633,17 @@ mod tests {
         assert!(WS_BROWSE_TTL_SECS > 0, "至少得有过期时间，不能永不过期");
         assert!(WS_MAX_RETRIES >= 1, "要求至少能重试一次");
         assert!(WS_THUMB_MAX_BYTES > 0 && WS_CACHE_MAX_BYTES > WS_THUMB_MAX_BYTES);
+        // 筛选：一页只发**一条**请求（`excludedtags[]` 一次就能表达组内 OR / 组间 AND，
+        // 见 `wp::workshop::Filter::query`），所以只剩防抖窗口这一个可调项。
+        // 300ms 是用户明确要的（太小 = 连点仍会各打一次网络）。
+        assert_eq!(WS_FILTER_DEBOUNCE_MS, 300, "防抖窗口是用户拍板的 300ms");
     }
 
     #[test]
     fn empty_config_means_balanced() {
         // 全新安装：什么都没设过 ⇒ 平衡档的**三项**（物理尺寸 / 全部特效 / 全屏睡眠）。
         // ⚠ 帧率不在这里：它逐场景算、默认 60（见下面 scene_fps 的用例）——
-        // 返回类型只有三项，这一点是编译期保证的。
+        //    返回类型只有三项，这一点是编译期保证的。
         let (scale, effects, sleep) = effective(&Config::default());
         assert_eq!((scale.as_str(), effects.as_str(), sleep.as_str()), ("physical", "all", "fullscreen"));
     }
@@ -627,7 +661,7 @@ mod tests {
     #[test]
     fn presets_are_distinct_and_ordered_low_to_high() {
         // 三档必须互不相同（不然"切档"没意义），且省电档是最省的那组、画质档是最费的那组。
-        // **帧率不参与档位**（起逐场景）：档位只剩这三项。
+        // **帧率不参与档位**（2026-10-14 起逐场景）：档位只剩这三项。
         let names: Vec<&str> = PRESETS.iter().map(|p| p.0).collect();
         assert_eq!(names, vec!["powersave", "balanced", "quality"]);
         assert_eq!((PRESET_POWERSAVE.1, PRESET_POWERSAVE.2, PRESET_POWERSAVE.3), ("logical", "none", "maximized"));
@@ -710,10 +744,10 @@ mod tests {
         assert_eq!(step_fps(120, 5), 120);
     }
 
-    /// 两条的行为，用断言钉住：
+    /// 2026-10-12 两条用户拍板的行为，用断言钉住：
     /// ① 宣传图**默认展示**（`show_promo = true`，但仍可关）；
     /// ② 画面色彩**按壁纸 id 分槽**：只有记过的那条受影响，别的条目不受牵连；
-    /// 旧的全局 `color` 字段当"没记录时的默认值"，老用户的设置不会丢。
+    ///    旧的全局 `color` 字段当"没记录时的默认值"，老用户的设置不会丢。
     #[test]
     fn promo_defaults_on_and_color_is_per_wallpaper() {
         let d = Config::default();
@@ -738,7 +772,7 @@ mod tests {
         assert_eq!(color_for_id(&cfg, "C"), "0.8,0.9,1,0,0,1");
     }
 
-    // ── 逐场景帧率：默认 60、逐场景记住、可回退 30 ─────────────
+    // ── 逐场景帧率（2026-10-14）：默认 60、逐场景记住、可回退 30 ─────────────
 
     /// 新默认就是 60，且**没有任何全局档**能把它盖成 30（旧病灶）。
     #[test]
@@ -803,7 +837,7 @@ mod tests {
     }
 
     /// **事故回放**（journal 原文的十个实测值）：那 30 秒机器上有别的负载 ⇒ 一次都不许降。
-    /// 这正是本次要修的缺陷 —— 把**外部负载**当成了**场景能力上限**。
+    /// 这正是本轮要修的缺陷 —— 把**外部负载**当成了**场景能力上限**。
     #[test]
     fn real_busy_machine_incident_never_downgrades_the_light_scene() {
         // 用户在看的 X-Ray 2564205376（低载实测 62.8fps ⇒ 完全跑得动 60）被压下来的那串值：
@@ -839,7 +873,7 @@ mod tests {
         assert!(old >= 3, "旧判据（<50 连续 3 次）确实会降 ⇒ 这就是 journal 里那次误降");
     }
 
-    /// **第二轮实测**（现场：另一个子代理在跑 `we-scene-render`，GPU 97~99%、
+    /// **第二轮实测**（2026-10-15 现场：另一个子代理在跑 `we-scene-render`，GPU 97~99%、
     /// 而 CPU 很闲 ⇒ loadavg 只有 2.5~3.3，**CPU 负载门看不见它**）：轻场景 X-Ray 实测被压成
     /// 26~47fps，而且**忽高忽低** ⇒ 只看"连续 6 次 < 40"会误降，加上"稳定"这一条才挡得住。
     /// 真重场景是**稳定**的 30 出头（极差 2.4），不会被这条判据误放。

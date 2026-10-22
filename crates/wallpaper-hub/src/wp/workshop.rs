@@ -1,20 +1,20 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: GPL-3.0-only
 //
 //! Wallpaper Engine 创意工坊「发现页」的后端：搜索 + 元数据 + 缩略图。
 //!
 //! **全程零登录**：
+//!   * 搜索/翻页 → 抓公开的 workshop browse 页面（拿 ID）
+//!   * 元数据   → 公开接口 `ISteamRemoteStorage/GetPublishedFileDetails`（无需 key）
+//!   * 缩略图   → 直接下 `preview_url`
 //!
-//! * 搜索/翻页 → 抓公开的 workshop browse 页面（拿 ID）
-//!
-//! * 元数据 → 公开接口 `ISteamRemoteStorage/GetPublishedFileDetails`（无需 key）
-//!
-//! * 缩略图 → 直接下 `preview_url`
-//! 订阅/下载**不在这里做**（起程序里也**没有任何登录/订阅入口**了）：
+//! 订阅/下载**不在这里做**（2026-10-21 起程序里也**没有任何登录/订阅入口**了）：
 //! 需要账号的动作请用详情面板的 [工坊页] 在浏览器/Steam 客户端里完成。
 //! 本程序只负责把「未下载的内容」摆出来（用 external_id 对照本地库判断已下载）。
 //!
 //! # 加载性能（这是本模块的重点）
-//! 实测（本机家宽，30 条/页）三个阶段：
+//!
+//! 实测（2026-10-12，本机家宽，30 条/页）三个阶段：
+//!
 //! | 阶段 | 耗时 | 说明 |
 //! |---|---|---|
 //! | 搜索页 browse | 1.75s | 一次 GET，无法再快 |
@@ -27,37 +27,34 @@
 //! 因此本模块：
 //!
 //! 1. **有上限地并发**：缩略图 12 路、详情按 30 条/批最多 3 批并行（`crate::config::WS_*`），
-//! 工作队列动态派发 —— 谁先下完谁接着下下一张，不被最慢的那张拖住。
-//!
+//!    工作队列动态派发 —— 谁先下完谁接着下下一张，不被最慢的那张拖住。
 //! 2. **每条请求都有超时**：建连 4s / 响应头 6s / 响应体 8s / 总 12s；
-//! 另外每个阶段有 wall-clock 预算，超预算只跳过不再重试。
-//!
+//!    另外每个阶段有 wall-clock 预算，超预算只跳过不再重试。
 //! 3. **失败隔离 + 一次重试**：单条失败（超时/断连/5xx/429）跳过并计数，绝不让整批失败；
-//! 4xx 等永久错误不重试。失败条数通过 [`Stats`] 回给界面。
-//!
+//!    4xx 等永久错误不重试。失败条数通过 [`Stats`] 回给界面。
 //! 4. **落盘缓存**（缩略图 30 天 / 详情 24h / 搜索页 5min）：二次进入 0 网络。
-//! 缓存写盘走「临时文件 + rename」，半截文件不会被当成命中。
+//!    缓存写盘走「临时文件 + rename」，半截文件不会被当成命中。
 //!
 //! # 线程模型（不许阻塞 UI）
 //!
 //! 本模块全部是**阻塞式** HTTP，**必须**在后台线程调用：
 //!
 //! * 界面一次性读取：`tokio::task::spawn_blocking(|| workshop::search(..))`（app.rs 现用这条路）；
-//!
 //! * 渐进式加载（先出条目、再补缩略图）：[`search_entries`] + [`load_thumbs`]，
-//! 或直接 [`prefetch_thumbs`]（自己起线程，立刻返回）。
+//!   或直接 [`prefetch_thumbs`]（自己起线程，立刻返回）。
+//!
 //! 任何情况下 UI 线程只做 `Handle::from_bytes` 这种 O(1) 的包装，不做网络、不做解码。
 //!
 //! app.rs 已接上渐进式加载（`Message::DiscoverResult` → `Task::stream(discover_thumb_stream(..))`）：
 //!
 //! ```ignore
 //! // Message::DiscoverRunSearch:
-//! // 1) 阶段一：search_entries → 拿到条目就 DiscoverResult（缓存命中时几十毫秒出内容）
-//! // 2) 阶段二：discover_thumb_stream → 后台并发下缩略图，**每下到一张就发一条消息**
-//! // （Message::DiscoverThumb）⇒ 界面逐张补图；结束后一条 Message::DiscoverThumbsDone
+//! //   1) 阶段一：search_entries()          → 拿到条目就 DiscoverResult（缓存命中时几十毫秒出内容）
+//! //   2) 阶段二：discover_thumb_stream()   → 后台并发下缩略图，**每下到一张就发一条消息**
+//! //      （Message::DiscoverThumb）⇒ 界面逐张补图；结束后一条 Message::DiscoverThumbsDone
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -113,6 +110,696 @@ pub const SORTS: [(&str, &str); 4] = [
     ("mostsubscribed", "订阅最多"),
 ];
 
+// ── 筛选：与 Win 版 WE 的筛选面板**逐项一致**（黑名单取反）─────────────────────
+//
+// 词表与语义**不是猜的**：来源 `artifacts/we-ui-filters-20261022/`（Win 版 WE 的明文
+// AngularJS 面板 `ui/dist/scripts/scripts.js` + `bin/wallpaperui.exe` 的 `.rdata` 指针表：
+// 6 组、真实 tag 值、默认值、查询语义全在里面，单测 `filter_matches_reversed_spec`
+// 直接读那份 JSON 逐组对比）。要点：
+//
+// * **勾选 = 不排除**（不是"必须有"）；**未勾的**才进 `excludedtags[]`
+// * 组内 **OR**、组间 **AND** 天然成立（同一个组只有未勾的进排除表 = OR；
+//   多组各自的排除表叠在一条查询里 = AND）
+// * 某组**全不勾**时追加字面量 `"Unspecified"`（WE 的保底）—— 否则"全不选"
+//   在 Steam 那边等于"不筛"，会返回全部而不是空
+// * `requiredtags[]` 只由两处写入：`Approved`（"仅显示"组）、三态 utility 标签设成"仅"
+// * 因此**一页只发一次请求**：上一版用 `requiredtags[]` + "多组合并集"模拟组内 OR，
+//   这次逆向推翻了 —— `excludedtags[]` 一次就能表达，不需要叉乘。
+
+/// 某个组的选项里"空组保底"用的字面量（WE 写死的字符串，不是真标签）。
+pub const UNSPECIFIED_FALLBACK: &str = "Unspecified";
+
+/// 一个可勾选项。`tag` 是 Steam 标签原文（**一字不改**：多一个空格 Steam 就不认），
+/// `label` 只管上屏。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Opt {
+    pub tag: &'static str,
+    pub label: &'static str,
+    /// WE **工坊源**的默认勾选态（`filters.json` → `defaults.workshop`）
+    pub default: bool,
+}
+
+impl Opt {
+    const fn on(tag: &'static str, label: &'static str) -> Self {
+        Self {
+            tag,
+            label,
+            default: true,
+        }
+    }
+    const fn off(tag: &'static str, label: &'static str) -> Self {
+        Self {
+            tag,
+            label,
+            default: false,
+        }
+    }
+}
+
+/// 组内的一小节：分辨率那 5 个宽高比子组、类型组里"壁纸/预设"那道分割线、
+/// 分辨率末尾两个不属于任何子组的尾巴。
+#[derive(Debug, Clone, Copy)]
+pub struct Section {
+    pub key: &'static str,
+    /// 小标题（"" = 本组的主小节，不印标题）
+    pub title: &'static str,
+    /// 带"所有 / 无"两个按钮？
+    pub all_none: bool,
+    /// "所有/无"要跳过的 tag（"" = 都管）。标签组跳过 `Unspecified`：
+    /// WE 在工坊源里把它强制不勾（`filters.json` → `all_none_note`）。
+    pub all_none_skip: &'static str,
+    /// 这一节是否**开始一个新的 WE 模型对象**（angular 的 typetags / categorytags /
+    /// ratingtags / resolutiontags / tags 各是一个对象）。空组保底按这个粒度算 ——
+    /// 分辨率的 5 个子组**共用**同一个 `resolutiontags`，所以只有第一个是 `true`。
+    pub new_unit: bool,
+    pub opts: &'static [Opt],
+}
+
+/// 一个筛选组（面板里的一块）。顺序 = WE 面板顺序（`filters.json` → `ui.group_order`）。
+#[derive(Debug, Clone, Copy)]
+pub struct Group {
+    /// 持久化用的键（`type:Application=0` 的前半段）。**改名会让老配置失效**，别动。
+    pub key: &'static str,
+    pub title: &'static str,
+    /// 默认收起？（类型 / 年龄分级 / 分辨率收起；来源 / 标签展开 ——
+    /// WE 里这两类组的 `ng-show` / `ng-hide` 约定相反，别"统一"掉。）
+    pub collapsed: bool,
+    /// 组级"所有 / 无"（只有"标签"组有；分辨率是每个子组各一对）
+    pub all_none: bool,
+    pub sections: &'static [Section],
+    /// 界面上那行小字（"" = 不印）
+    pub note: &'static str,
+    /// 会不会进查询参数。**来源组是纯本地过滤**（WE 只对"已安装"项生效），浏览页不发。
+    pub query_backed: bool,
+}
+
+pub const G_TYPE: &str = "type";
+pub const G_RATING: &str = "rating";
+pub const G_RESOLUTION: &str = "resolution";
+pub const G_SOURCE: &str = "source";
+pub const G_TAGS: &str = "tags";
+
+/// 四个"黑名单"组 + 一个纯本地组。**没有**"仅显示"组：它不是黑名单
+/// （勾上 = 进 `requiredtags[]` / 额外排除），单独用 [`SHOW_ONLY`] 表示。
+pub const GROUPS: [Group; 5] = [
+    Group {
+        key: G_TYPE,
+        title: "类型",
+        collapsed: true,
+        all_none: false,
+        query_backed: true,
+        note: "勾选 = 不排除。Application 在 WE 的工坊浏览页被隐藏、默认不勾",
+        sections: &[
+            Section {
+                key: "type",
+                title: "",
+                all_none: false,
+                all_none_skip: "",
+                new_unit: true,
+                opts: &[
+                    Opt::on("Scene", "场景"),
+                    Opt::on("Video", "视频"),
+                    Opt::on("Web", "网页"),
+                    Opt::off("Application", "应用程序"),
+                ],
+            },
+            Section {
+                key: "category",
+                title: "分类",
+                all_none: false,
+                all_none_skip: "",
+                new_unit: true,
+                opts: &[Opt::on("Wallpaper", "壁纸"), Opt::on("Preset", "预设")],
+            },
+        ],
+    },
+    Group {
+        key: G_RATING,
+        title: "年龄分级",
+        collapsed: true,
+        all_none: false,
+        query_backed: true,
+        note: "默认只勾「大众级」⇒ PG-13 / R-18 默认被排除（= WE 默认）",
+        sections: &[Section {
+            key: "rating",
+            title: "",
+            all_none: false,
+            all_none_skip: "",
+            new_unit: true,
+            opts: &[
+                Opt::on("Everyone", "大众级 G"),
+                Opt::off("Questionable", "家长指导 PG-13"),
+                Opt::off("Mature", "成人 R-18"),
+            ],
+        }],
+    },
+    Group {
+        key: G_RESOLUTION,
+        title: "分辨率",
+        collapsed: true,
+        all_none: false,
+        query_backed: true,
+        note: "5 个宽高比子组各带「所有/无」；末尾两项不属于任何子组（默认全勾）",
+        sections: &[
+            Section {
+                key: "widescreen",
+                title: "宽屏",
+                all_none: true,
+                all_none_skip: "",
+                new_unit: true,
+                opts: &[
+                    Opt::on("Standard Definition", "标清"),
+                    Opt::on("1280 x 720", "1280 x 720"),
+                    Opt::on("1366 x 768", "1366 x 768"),
+                    Opt::on("1920 x 1080", "1920 x 1080 - 全高清"),
+                    Opt::on("2560 x 1440", "2560 x 1440"),
+                    Opt::on("3840 x 2160", "3840 x 2160 - 4K"),
+                ],
+            },
+            Section {
+                key: "ultrawide",
+                title: "超宽屏",
+                all_none: true,
+                all_none_skip: "",
+                new_unit: false,
+                opts: &[
+                    Opt::on("Ultrawide Standard Definition", "超宽（标准）"),
+                    Opt::on("Ultrawide 2560 x 1080", "2560 x 1080"),
+                    Opt::on("Ultrawide 3440 x 1440", "3440 x 1440"),
+                ],
+            },
+            Section {
+                key: "dual",
+                title: "双显示器",
+                all_none: true,
+                all_none_skip: "",
+                new_unit: false,
+                opts: &[
+                    Opt::on("Dual Standard Definition", "双显示器（标准）"),
+                    Opt::on("Dual 3840 x 1080", "3840 x 1080"),
+                    Opt::on("Dual 5120 x 1440", "5120 x 1440"),
+                    Opt::on("Dual 7680 x 2160", "7680 x 2160"),
+                ],
+            },
+            Section {
+                key: "triple",
+                title: "三显示器",
+                all_none: true,
+                all_none_skip: "",
+                new_unit: false,
+                opts: &[
+                    Opt::on("Triple Standard Definition", "三显示器（标准）"),
+                    Opt::on("Triple 4096 x 768", "4096 x 768"),
+                    Opt::on("Triple 5760 x 1080", "5760 x 1080"),
+                    Opt::on("Triple 7680 x 1440", "7680 x 1440"),
+                    Opt::on("Triple 11520 x 2160", "11520 x 2160"),
+                ],
+            },
+            Section {
+                key: "portrait",
+                title: "纵向监视器/手机",
+                all_none: true,
+                all_none_skip: "",
+                new_unit: false,
+                opts: &[
+                    Opt::on("Portrait Standard Definition", "纵向（标准）"),
+                    Opt::on("Portrait 720 x 1280", "720 x 1280"),
+                    Opt::on("Portrait 1080 x 1920", "1080 x 1920"),
+                    Opt::on("Portrait 1440 x 2560", "1440 x 2560"),
+                    Opt::on("Portrait 2160 x 3840", "2160 x 3840"),
+                ],
+            },
+            Section {
+                key: "tail",
+                title: "",
+                all_none: false,
+                all_none_skip: "",
+                new_unit: false,
+                opts: &[
+                    Opt::on("Other resolution", "其他分辨率"),
+                    Opt::on("Dynamic resolution", "动态分辨率"),
+                ],
+            },
+        ],
+    },
+    Group {
+        key: G_SOURCE,
+        title: "来源",
+        collapsed: false,
+        all_none: false,
+        // WE 里这一组用 `ng-hide="filterHideSource"`（变量为真 = 收起），初始 undefined
+        // ⇒ **展开**；而且只在"已安装"源出现。
+        query_backed: false,
+        note: "只对「已安装」项有意义（WE：工坊浏览页整组隐藏）⇒ 本页不发查询参数",
+        sections: &[Section {
+            key: "source",
+            title: "",
+            all_none: false,
+            all_none_skip: "",
+            new_unit: true,
+            opts: &[
+                Opt::on("Official", "官方"),
+                Opt::on("Workshop", "创意工坊"),
+                Opt::on("Local", "我的壁纸"),
+            ],
+        }],
+    },
+    Group {
+        key: G_TAGS,
+        title: "标签",
+        collapsed: false,
+        all_none: true,
+        query_backed: true,
+        note: "25 个真实风格标签（`Unspecified` 排在末尾，WE 也是这么挪的）",
+        sections: &[Section {
+            key: "tags",
+            title: "",
+            all_none: true,
+            all_none_skip: "Unspecified",
+            new_unit: true,
+            opts: &[
+                Opt::on("Abstract", "抽象"),
+                Opt::on("Animal", "动物"),
+                Opt::on("Anime", "动漫"),
+                Opt::on("Cartoon", "卡通"),
+                Opt::on("CGI", "CGI"),
+                Opt::on("Cyberpunk", "网络朋克"),
+                Opt::on("Fantasy", "幻想"),
+                Opt::on("Game", "游戏"),
+                Opt::on("Girls", "女性"),
+                Opt::on("Guys", "男性"),
+                Opt::on("Landscape", "风景"),
+                Opt::on("Medieval", "中世纪"),
+                Opt::on("Memes", "网红事物"),
+                Opt::on("MMD", "MMD"),
+                Opt::on("Music", "音乐"),
+                Opt::on("Nature", "自然"),
+                Opt::on("Pixel art", "像素艺术"),
+                Opt::on("Relaxing", "放松"),
+                Opt::on("Retro", "复古"),
+                Opt::on("Sci-Fi", "科幻"),
+                Opt::on("Sports", "运动"),
+                Opt::on("Technology", "科技"),
+                Opt::on("Television", "电视节目"),
+                Opt::on("Vehicle", "汽车"),
+                // C++ 的数组以它开头，scripts.js 把它挪到末尾再渲染 ⇒ 界面顺序照抄
+                Opt::off("Unspecified", "未指定样式"),
+            ],
+        }],
+    },
+];
+
+/// 「仅显示」组（WE 里唯一**不可折叠**的 `groupBox`）：勾上 ≠ 不排除，
+/// 而是"必须带这个标签"（`requiredtags[]`）或"额外排除这几个"。
+pub struct OnlyOpt {
+    pub key: &'static str,
+    pub label: &'static str,
+}
+
+pub const ONLY_APPROVED: &str = "approved";
+pub const ONLY_MOBILE: &str = "mobile_compatible";
+
+/// WE 的"仅显示"组里还有 **「我的收藏」**（纯本地、要登录态）和**两个 utility 标签**
+/// （tag 由 C++ `setAvailableTags(arg2)` 运行时下发，逆向**没取到值**，
+/// 见 `filters.json` → `confidence.utility_tags = unresolved`）——
+/// 这两样这里都不渲染：前者我们没有登录态，后者连 tag 字符串都不知道，编不出来。
+pub const SHOW_ONLY: [OnlyOpt; 2] = [
+    // 勾上 ⇒ `requiredtags[]=Approved`
+    OnlyOpt {
+        key: ONLY_APPROVED,
+        label: "广受好评",
+    },
+    // 勾上 ⇒ 额外排除 Application/Web（WE 还带 kvs，网页端没有这个参数）
+    OnlyOpt {
+        key: ONLY_MOBILE,
+        label: "手机兼容",
+    },
+];
+
+/// 某组的所有 `(tag, 显示名)`（校验配置/请求只允许真实标签）。
+pub fn group_opts(key: &str) -> impl Iterator<Item = &'static Opt> {
+    GROUPS
+        .iter()
+        .filter(move |g| g.key == key)
+        .flat_map(|g| g.sections.iter())
+        .flat_map(|s| s.opts.iter())
+}
+
+/// 某个 tag 在该组里是不是真实存在（配置里存了旧/错的 tag 时会被它挡掉）。
+pub fn is_real_tag(key: &str, tag: &str) -> bool {
+    group_opts(key).any(|o| o.tag == tag)
+}
+
+/// WE 的 `browserSettings.defaultfilterconfig`（默认
+/// `{recommendedresolution:false, showotherresolution:true, Anime:null}`）。
+///
+/// 我们没抄 WE 那个 [⚙ 筛选器设置] 对话框，所以这里**恒为默认值**；结构留着是为了
+/// "重置 = 重建默认 + 套这份配置"这条链路与 WE 一一对应（也能被单测覆盖）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DefaultFilterConfig {
+    /// `true` ⇒ 取消"推荐分辨率"整组。
+    /// ⚠ WE 里"推荐"到底是哪一档**逆向没定下来**（`filters.json` 只写
+    /// "unchecks the whole 'recommended' resolution set"，没给集合），所以这里**不猜**：
+    /// 该位为 true 时一个字都不改，只打一行日志（默认 false ⇒ 不影响重置结果）。
+    pub recommended_resolution: bool,
+    /// `false` ⇒ 取消 `Other resolution`
+    pub show_other_resolution: bool,
+    /// `Some(false)` ⇒ 额外取消 Anime / MMD / Girls / Guys / Music（WE 的"不要动漫"）
+    pub anime: Option<bool>,
+}
+
+impl Default for DefaultFilterConfig {
+    fn default() -> Self {
+        Self {
+            recommended_resolution: false,
+            show_other_resolution: true,
+            anime: None,
+        }
+    }
+}
+
+impl DefaultFilterConfig {
+    pub fn apply(&self, f: &mut Filter) {
+        if self.anime == Some(false) {
+            for tag in ["Anime", "MMD", "Girls", "Guys", "Music"] {
+                f.set_checked(G_TAGS, tag, false);
+            }
+        }
+        if !self.show_other_resolution {
+            f.set_checked(G_RESOLUTION, "Other resolution", false);
+        }
+        if self.recommended_resolution {
+            wtrace(
+                "defaultfilterconfig.recommendedresolution=true：\"推荐分辨率\"集合逆向未定，本次不改分辨率",
+            );
+        }
+    }
+}
+
+/// 一次查询要带的标签。两个表都**排好序、去重**（同一组只有一个结论，
+/// 顺序只影响缓存键 ⇒ 排好序才能让同样的筛选命中同一份缓存）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Query {
+    pub required: Vec<String>,
+    pub excluded: Vec<String>,
+}
+
+/// 多选筛选状态。**与 WE 同构**：每个选项一个 bool，`true` = 勾选 = **不排除**。
+///
+/// 只存"未勾选项"这一半（其余按默认值补齐）：默认值是 `filters.json` 里的
+/// `defaults.workshop`，所以 `Filter::default()` **就是 WE 的默认筛选**
+/// （排除 Application、只留大众级、分辨率全勾、标签全勾除 Unspecified）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Filter {
+    /// 未勾选的项 `(组键, tag)`
+    unchecked: BTreeSet<(&'static str, &'static str)>,
+    /// 「仅显示」里勾上的项
+    only: BTreeSet<&'static str>,
+}
+
+impl Default for Filter {
+    fn default() -> Self {
+        let mut unchecked = BTreeSet::new();
+        for group in &GROUPS {
+            for section in group.sections {
+                for opt in section.opts {
+                    if !opt.default {
+                        unchecked.insert((group.key, opt.tag));
+                    }
+                }
+            }
+        }
+        Self {
+            unchecked,
+            only: BTreeSet::new(),
+        }
+    }
+}
+
+impl Filter {
+    /// 组键 + tag ⇒ `(组, 选项)`；不认识就是 None。
+    fn find(group_key: &str, tag: &str) -> Option<(&'static Group, &'static Opt)> {
+        GROUPS.iter().find(|g| g.key == group_key).and_then(|g| {
+            g.sections
+                .iter()
+                .flat_map(|s| s.opts.iter())
+                .find(|o| o.tag == tag)
+                .map(|o| (g, o))
+        })
+    }
+
+    /// 这一项**勾着**吗（= 不排除）。不认识的组/标签 ⇒ `true`：
+    /// 宁可"什么都没排除"，也绝不因为一个手滑的字符串把结果排空。
+    pub fn checked(&self, group_key: &str, tag: &str) -> bool {
+        match Self::find(group_key, tag) {
+            Some((g, opt)) => !self.unchecked.contains(&(g.key, opt.tag)),
+            None => true,
+        }
+    }
+
+    /// 勾/去勾一项。返回 **false = 组或标签不认识**（什么都没改）。
+    pub fn set_checked(&mut self, group_key: &str, tag: &str, on: bool) -> bool {
+        let Some((g, opt)) = Self::find(group_key, tag) else {
+            return false;
+        };
+        if on {
+            self.unchecked.remove(&(g.key, opt.tag));
+        } else {
+            self.unchecked.insert((g.key, opt.tag));
+        }
+        true
+    }
+
+    /// 点一下：返回**操作后**是否勾选。组/标签不认识 ⇒ `false` 且什么都不改
+    /// （点了没反应，但绝不会发一个 Steam 不认的标签）。
+    pub fn toggle(&mut self, group_key: &str, tag: &str) -> bool {
+        let now = !self.checked(group_key, tag);
+        if !self.set_checked(group_key, tag, now) {
+            return false;
+        }
+        now
+    }
+
+    /// 某小节「所有 / 无」（`all` = 全勾）。`all_none_skip` 的项不动
+    /// （标签组的 `Unspecified`：WE 在工坊源里强制不勾它）。
+    pub fn set_section(&mut self, group_key: &str, section_key: &str, all: bool) {
+        let Some(group) = GROUPS.iter().find(|g| g.key == group_key) else {
+            return;
+        };
+        let Some(section) = group.sections.iter().find(|s| s.key == section_key) else {
+            return;
+        };
+        for opt in section.opts {
+            if !section.all_none_skip.is_empty() && opt.tag == section.all_none_skip {
+                continue;
+            }
+            self.set_checked(group.key, opt.tag, all);
+        }
+    }
+
+    pub fn only(&self, key: &str) -> bool {
+        self.only.contains(key)
+    }
+
+    pub fn set_only(&mut self, key: &str, on: bool) -> bool {
+        let Some(opt) = SHOW_ONLY.iter().find(|o| o.key == key) else {
+            return false;
+        };
+        if on {
+            self.only.insert(opt.key);
+        } else {
+            self.only.remove(opt.key);
+        }
+        true
+    }
+
+    /// 点一下「仅显示」里的一项，返回操作后的状态。
+    pub fn toggle_only(&mut self, key: &str) -> bool {
+        if !self.set_only(key, !self.only(key)) {
+            return false;
+        }
+        self.only(key)
+    }
+
+    /// 重置为**默认值**（不是清空）＋套 `defaultfilterconfig`。
+    /// WE 的"重置过滤器"就是这条路径（`callbackResetFilter()`）。
+    pub fn reset(&mut self) {
+        self.reset_with(&DefaultFilterConfig::default());
+    }
+
+    pub fn reset_with(&mut self, cfg: &DefaultFilterConfig) {
+        *self = Self::default();
+        cfg.apply(self);
+    }
+
+    /// 与默认值不同的**项数**（"（已筛选）"角标与日志用）。
+    pub fn changed_count(&self) -> usize {
+        let d = Self::default();
+        let opts_changed = self
+            .unchecked
+            .symmetric_difference(&d.unchecked)
+            .count();
+        opts_changed + self.only.symmetric_difference(&d.only).count()
+    }
+
+    /// 某一组是否被改过（每组标题旁的"（已筛选）"角标；`show_only` 也认）。
+    pub fn group_changed(&self, group_key: &str) -> bool {
+        let d = Self::default();
+        let mut changed = false;
+        for group in GROUPS.iter().filter(|g| g.key == group_key) {
+            for section in group.sections {
+                for opt in section.opts {
+                    let now = !self.unchecked.contains(&(group.key, opt.tag));
+                    let def = !d.unchecked.contains(&(group.key, opt.tag));
+                    changed |= now != def;
+                }
+            }
+        }
+        if group_key == "show_only" {
+            changed |= !self.only.is_empty();
+        }
+        changed
+    }
+
+    /// 一行摘要（收起时/日志用）：只列**与默认不同**的组，形如
+    /// `类型 4/5 · 标签 20/25 · 仅显示 广受好评`
+    pub fn describe(&self) -> String {
+        let mut parts = Vec::new();
+        if !self.only.is_empty() {
+            let names: Vec<&str> = SHOW_ONLY
+                .iter()
+                .filter(|o| self.only(o.key))
+                .map(|o| o.label)
+                .collect();
+            parts.push(format!("仅显示 {}", names.join("/")));
+        }
+        for group in &GROUPS {
+            if !self.group_changed(group.key) {
+                continue;
+            }
+            let total: usize = group.sections.iter().map(|s| s.opts.len()).sum();
+            let on: usize = group
+                .sections
+                .iter()
+                .flat_map(|s| s.opts.iter())
+                .filter(|o| self.checked(group.key, o.tag))
+                .count();
+            parts.push(format!("{} {on}/{total}", group.title));
+        }
+        if parts.is_empty() {
+            "WE 默认筛选".to_string()
+        } else {
+            parts.join(" · ")
+        }
+    }
+
+    /// 构造查询的 `requiredtags[]` / `excludedtags[]`。
+    pub fn query(&self) -> Query {
+        let mut req: BTreeSet<String> = BTreeSet::new();
+        let mut excl: BTreeSet<String> = BTreeSet::new();
+
+        // 「仅显示」：Approved 走**白名单**侧；手机兼容走额外排除
+        if self.only(ONLY_APPROVED) {
+            req.insert("Approved".to_string());
+        }
+        if self.only(ONLY_MOBILE) {
+            excl.insert("Application".to_string());
+            excl.insert("Web".to_string());
+        }
+
+        for group in GROUPS.iter().filter(|g| g.query_backed) {
+            // 空组保底的粒度 = WE 的"一个 angular 模型对象"（见 `Section::new_unit`）
+            let mut unit_started = false;
+            let mut unit_any_checked = false;
+            for section in group.sections {
+                if section.new_unit && unit_started {
+                    if !unit_any_checked {
+                        excl.insert(UNSPECIFIED_FALLBACK.to_string());
+                    }
+                    unit_any_checked = false;
+                }
+                unit_started = true;
+                for opt in section.opts {
+                    if self.unchecked.contains(&(group.key, opt.tag)) {
+                        excl.insert(opt.tag.to_string());
+                    } else {
+                        unit_any_checked = true;
+                    }
+                }
+            }
+            if unit_started && !unit_any_checked {
+                excl.insert(UNSPECIFIED_FALLBACK.to_string());
+            }
+        }
+
+        Query {
+            required: req.into_iter().collect(),
+            excluded: excl.into_iter().collect(),
+        }
+    }
+
+    /// 存进配置的形状：**只写与默认值不同的项**，一行一个 `组键:标签=1|0`（1 = 勾选）。
+    /// 空表 = 就是默认（全新安装 / 点过"重置过滤器"都是这个状态）。
+    pub fn to_lines(&self) -> Vec<String> {
+        let d = Self::default();
+        let mut out = Vec::new();
+        for group in &GROUPS {
+            for section in group.sections {
+                for opt in section.opts {
+                    let now = !self.unchecked.contains(&(group.key, opt.tag));
+                    let def = !d.unchecked.contains(&(group.key, opt.tag));
+                    if now != def {
+                        out.push(format!("{}:{}={}", group.key, opt.tag, u8::from(now)));
+                    }
+                }
+            }
+        }
+        for opt in &SHOW_ONLY {
+            if self.only(opt.key) {
+                out.push(format!("only:{}={}", opt.key, 1));
+            }
+        }
+        out
+    }
+
+    /// 从配置读回来。**不认识的组键 / 不是真标签的行直接丢掉**（并打一行日志）：
+    /// 词表变了（Steam 改标签、我们删了某组）时，老配置不该把筛选卡在
+    /// "永远筛不到东西"的状态上。
+    pub fn from_lines(lines: &[String]) -> Self {
+        let mut filter = Self::default();
+        for line in lines {
+            let Some((head, flag)) = line.rsplit_once('=') else {
+                // 上一版的形状是 `组键:标签`（无 `=`），而且语义是**反的**
+                // （那时存的是"选中"，现在存的是"勾选/未勾"）⇒ 一律丢掉，从默认重建
+                wtrace(&format!("筛选配置丢一行（没有 = 状态位）：{line:?}"));
+                continue;
+            };
+            let on = match flag.trim() {
+                "1" => true,
+                "0" => false,
+                other => {
+                    wtrace(&format!("筛选配置丢一行（状态位不是 0/1）：{other:?}"));
+                    continue;
+                }
+            };
+            let Some((key, tag)) = head.split_once(':') else {
+                wtrace(&format!("筛选配置丢一行（没有冒号）：{line:?}"));
+                continue;
+            };
+            let (key, tag) = (key.trim(), tag.trim());
+            let ok = if key == "only" {
+                filter.set_only(tag, on)
+            } else {
+                filter.set_checked(key, tag, on)
+            };
+            if !ok {
+                wtrace(&format!("筛选配置丢一行（组/标签不在词表里）：{line:?}"));
+            }
+        }
+        filter
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Item {
     pub id: String,
@@ -163,6 +850,13 @@ pub struct Stats {
     /// 搜索页来自缓存（新／旧）
     pub browse_cached: bool,
     pub browse_stale: bool,
+    /// 这一页**一共发了几个** browse 请求（筛选的多选组合各算一个；无筛选时 = 1）。
+    /// 界面上要能看出"这次筛选打了 2 次网络"，也是防抖验收的计数来源。
+    pub queries: usize,
+    /// Steam 页面上报的**总条数**（`total_count`，工坊全站口径）。
+    /// 筛选一变这个数就变 ⇒ 这就是"筛选真的生效了"最硬的证据；解析不到就是 None。
+    /// 多组合时是各组合之和（含重叠），所以 status 里要说明。
+    pub total_count: Option<u64>,
 }
 
 impl Stats {
@@ -191,7 +885,7 @@ struct Counters {
 pub struct SearchResult {
     pub items: Vec<Item>,
     /// 已下载的缩略图（id → 原始字节），交给 UI 转成图片句柄
-    #[allow(dead_code)] // 一次性 search 会填它；界面现在走渐进式（load_thumbs_streaming），不读这个字段
+    #[allow(dead_code)] // 一次性 search() 会填它；界面现在走渐进式（load_thumbs_streaming），不读这个字段
     pub thumbs: Vec<(String, Vec<u8>)>,
     /// 各阶段耗时/失败计数（界面状态条与日志用；app.rs 接上就会读它）
     #[allow(dead_code)]
@@ -208,6 +902,7 @@ pub fn search(
     query: &str,
     page: u32,
     sort_key: &str,
+    filter: &Filter,
     want_thumbs: usize,
 ) -> Result<SearchResult, String> {
     let t0 = Instant::now();
@@ -217,7 +912,7 @@ pub fn search(
         ..Stats::default()
     };
 
-    let ids = ids_for(query, page, sort_key, &mut stats)?;
+    let ids = ids_for(query, page, sort_key, filter, &mut stats)?;
     if ids.is_empty() {
         stats.total_ms = ms_since(t0);
         wtrace(&format!("total {}（搜索页没有解析到条目）", describe_stats(&stats)));
@@ -236,17 +931,22 @@ pub fn search(
 }
 
 /// 阶段一：**只要条目**（搜索页 + 详情），不碰缩略图 —— 冷启动约 4s、缓存命中时几十毫秒出内容。
+///
 /// 配 [`load_thumbs`] / [`load_thumbs_streaming`] 用，才能做到"先出条目、再补图"。
 /// app.rs 的发现页/创意工坊页走的就是这条路（详见模块头）。
-pub fn search_entries(query: &str, page: u32, sort_key: &str) -> Result<SearchResult, String> {
+pub fn search_entries(
+    query: &str,
+    page: u32,
+    sort_key: &str,
+    filter: &Filter,
+) -> Result<SearchResult, String> {
     let t0 = Instant::now();
     housekeeping(&cache_root());
     let mut stats = Stats {
         concurrency: cfg::WS_THUMB_CONCURRENCY,
         ..Stats::default()
     };
-//
-    let ids = ids_for(query, page, sort_key, &mut stats)?;
+    let ids = ids_for(query, page, sort_key, filter, &mut stats)?;
     let items = if ids.is_empty() {
         Vec::new()
     } else {
@@ -275,7 +975,7 @@ pub fn load_thumbs(items: &[Item], want: usize, stats: &mut Stats) -> Vec<(Strin
 ///
 /// 与 [`load_thumbs`] 的区别：后者要等这一批**全部**下完才返回（界面那一下只能整批刷新），
 /// 本函数边下边回调 ⇒ 界面可以一张一张地补图（发现页用的就是它）。
-/// 回调从工作线程调用、必须轻量且非阻塞；`want` 一般传 `items.len`（全部都要）。
+/// 回调从工作线程调用、必须轻量且非阻塞；`want` 一般传 `items.len()`（全部都要）。
 /// **阻塞式**：调用方要放在后台线程里（app.rs 用 `Task::stream` + 一个后台线程包住它）。
 pub fn load_thumbs_streaming(
     on_thumb: &(dyn Fn(String, Vec<u8>) + Sync),
@@ -313,7 +1013,7 @@ pub fn prefetch_thumbs(items: Vec<Item>, want: usize) {
 
 /// 一行中文摘要（日志/界面状态条都能直接用）。
 pub fn describe_stats(s: &Stats) -> String {
-    format!(
+    let mut text = format!(
         "总共 {}ms（搜索页 {}ms{} / 详情 {}ms 命中 {} 失败 {} / 缩略图 {}ms 命中 {} 失败 {}，并发 {}，重试 {}，超时 {} · 链接 {} 次 → 唯一 id {} · 同 id 折叠 {}）",
         s.total_ms,
         s.browse_ms,
@@ -334,7 +1034,15 @@ pub fn describe_stats(s: &Stats) -> String {
         s.link_occurrences,
         s.ids,
         s.duplicates,
-    )
+    );
+    // 筛选：发了几个组合、Steam 报的总条数 —— 这两项是"筛选真的生效了"的证据
+    if s.queries > 1 {
+        text.push_str(&format!(" · 筛选组合 {}", s.queries));
+    }
+    if let Some(total) = s.total_count {
+        text.push_str(&format!(" · 工坊总条数 {total}"));
+    }
+    text
 }
 
 /// 缓存目录：`$WPHUB_WORKSHOP_CACHE_DIR`（可覆盖，测试/搬盘用）
@@ -350,7 +1058,7 @@ pub fn cache_root() -> PathBuf {
     }
     let base = match std::env::var("XDG_CACHE_HOME") {
         Ok(dir) if !dir.is_empty() => PathBuf::from(dir),
-        _ => PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into())).join(".cache"),
+        _ => PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/home/dev".into())).join(".cache"),
     };
     base.join("wallpaper-hub").join("workshop")
 }
@@ -464,9 +1172,7 @@ fn classify(err: ureq::Error) -> Attempt {
 /// 统一的"请求 + 超时 + 最多重试一次"包装。
 ///
 /// * 每次尝试自身受 agent 的超时约束（建连/响应头/响应体/总时长）；
-///
 /// * `deadline` 是**阶段**预算：都快超预算了就不再重试，宁可少一条也别把整页拖住；
-///
 /// * 失败只记数并返回 Err，由调用方决定"跳过这一条"。
 fn with_retry(
     label: &str,
@@ -542,69 +1248,152 @@ where
 
 // ── 阶段一：搜索页（拿 id） ────────────────────────────────────────────────
 
-fn ids_for(query: &str, page: u32, sort_key: &str, stats: &mut Stats) -> Result<Vec<String>, String> {
-    let t0 = Instant::now();
+/// browse 页 URL（`tags` = 每个筛选组各取一个 tag；空 = 不筛）。
+///
+/// 参数名/编码都按 Steam 的来：`requiredtags[]=`、方括号百分号编码成 `%5B%5D`
+/// （不编码 Steam 也认，但 `%5B` 是它自己页面上的写法）。
+pub fn browse_url(query: &str, page: u32, sort_key: &str, q: &Query) -> String {
     let mut url = format!(
         "{}?appid={APPID}&section=readytouseitems&browsesort={sort_key}&p={page}&numperpage=30",
         browse_base()
     );
-    let q = query.trim();
-    if !q.is_empty() {
+    let text = query.trim();
+    if !text.is_empty() {
         url.push_str("&searchtext=");
-        url.push_str(&urlencode(q));
+        url.push_str(&urlencode(text));
     }
+    // 参数名/编码都按 Steam 的来：方括号百分号编码成 `%5B%5D`
+    // （不编码 Steam 也认，但 `%5B` 是它自己页面上的写法）。
+    // `excludedtags[]` 是 WE 真正用的那一侧：勾选 = **不排除** ⇒ 这里只放"未勾"的。
+    for tag in &q.required {
+        url.push_str("&requiredtags%5B%5D=");
+        url.push_str(&urlencode(tag));
+    }
+    for tag in &q.excluded {
+        url.push_str("&excludedtags%5B%5D=");
+        url.push_str(&urlencode(tag));
+    }
+    url
+}
 
-    let key = format!("{}.html", fnv1a_hex(&url));
+/// 真正发出去的 browse GET 次数（**只数网络请求，缓存命中不算**）。
+///
+/// 存在的理由是验收"防抖"：连点 5 次筛选，如果防抖没生效这里会跳 5 次以上；
+/// 生效的话一个 300ms 窗口只放行一次。日志里每次放行都印一次它的增量。
+pub fn browse_fetch_count() -> u64 {
+    BROWSE_FETCHES.load(Ordering::Relaxed)
+}
+
+static BROWSE_FETCHES: AtomicU64 = AtomicU64::new(0);
+
+/// 一页 browse 的解析结果（每个筛选组合一份）。
+struct BrowsePage {
+    ids: Vec<String>,
+    occurrences: usize,
+    /// 页面上报的工坊总条数（`total_count`）；解析不到 = None
+    total: Option<u64>,
+    cached: bool,
+    stale: bool,
+    c: Counters,
+}
+
+fn fetch_browse_page(url: &str) -> Result<BrowsePage, String> {
+    let key = format!("{}.html", fnv1a_hex(url));
     let mut c = Counters::default();
-    let body = match cache_read("browse", &key, cfg::WS_BROWSE_TTL_SECS) {
-        Some(cached) => {
-            stats.browse_cached = true;
-            cached
-        }
+    let (body, cached, stale) = match cache_read("browse", &key, cfg::WS_BROWSE_TTL_SECS) {
+        Some(hit) => (hit, true, false),
         None => {
             let deadline = Instant::now() + Duration::from_millis(cfg::WS_BROWSE_BUDGET_MS);
             match with_retry("browse", deadline, &mut c, || {
-                get_bytes(agent_api(), &url, BROWSE_MAX_BYTES)
+                BROWSE_FETCHES.fetch_add(1, Ordering::Relaxed);
+                get_bytes(agent_api(), url, BROWSE_MAX_BYTES)
             }) {
                 Ok(bytes) => {
                     let _ = cache_write("browse", &key, &bytes);
-                    bytes
+                    (bytes, false, false)
                 }
                 Err(err) => {
                     // 单请求失败：退回**过期**缓存（宁可给旧结果也别给空页），完全没有才报错
                     match cache_read("browse", &key, u64::MAX) {
                         Some(stale) => {
-                            stats.browse_stale = true;
                             wtrace(&format!("搜索页请求失败（{err}），退回旧缓存"));
-                            stale
+                            (stale, false, true)
                         }
-                        None => {
-                            stats.browse_ms = ms_since(t0);
-                            return Err(format!("创意工坊搜索页请求失败: {err}"));
-                        }
+                        None => return Err(format!("创意工坊搜索页请求失败: {err}")),
                     }
                 }
             }
         }
     };
-    stats.retries += c.retries;
-    stats.timed_out += c.timed_out;
+    let html = String::from_utf8_lossy(&body);
+    let (ids, occurrences) = extract_ids_counted(&html);
+    Ok(BrowsePage {
+        ids,
+        occurrences,
+        total: parse_total_count(&html),
+        cached,
+        stale,
+        c,
+    })
+}
 
-    let (ids, occurrences) = extract_ids_counted(&String::from_utf8_lossy(&body));
-    stats.ids = ids.len();
-    stats.link_occurrences = occurrences;
+/// 从 browse 页里读 `total_count`（工坊总条数）。
+///
+/// 页面把它埋在 React Query 的初始数据里，形如 `\\\"total_count\\\":2923758`
+/// （套了几层转义）。所以这里**不按整串匹配**：找到 `total_count` 之后往后扫，
+/// 跳过引号/冒号/反斜杠，读第一段连续数字。读不到就 None（界面就不显示总数）。
+///
+/// 这个数是筛选生效最硬的证据：实测无筛选 2 923 758 → `Anime` 731 392 →
+/// `Anime`+`Scene` 406 706。
+pub fn parse_total_count(html: &str) -> Option<u64> {
+    const NEEDLE: &str = "total_count";
+    let at = html.find(NEEDLE)?;
+    let after = &html[at + NEEDLE.len()..];
+    let start = after.find(|c: char| c.is_ascii_digit())?;
+    let digits: String = after[start..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    // 上限保护：`total_count` 后面紧跟的数字不可能有十几位（只取前 18 位）
+    digits.get(..digits.len().min(18))?.parse().ok()
+}
+
+fn ids_for(
+    query: &str,
+    page: u32,
+    sort_key: &str,
+    filter: &Filter,
+    stats: &mut Stats,
+) -> Result<Vec<String>, String> {
+    let t0 = Instant::now();
+    let q = filter.query();
+    let url = browse_url(query, page, sort_key, &q);
+    // 一页**一条**请求：组内 OR / 组间 AND 全由 `excludedtags[]` 表达
+    // （上一版按组合叉乘发 N 条再并集，已被这次逆向推翻 —— 见 `Filter::query`）
+    stats.queries = 1;
+    let p = fetch_browse_page(&url)?;
+    stats.retries += p.c.retries;
+    stats.timed_out += p.c.timed_out;
+    stats.browse_cached = p.cached;
+    stats.browse_stale = p.stale;
+    stats.total_count = p.total;
+    stats.link_occurrences = p.occurrences;
+    stats.ids = p.ids.len();
     stats.browse_ms = ms_since(t0);
     wtrace(&format!(
-        "browse {}ms 链接 {} 次 → 唯一 id {}（页面内同 id 已按 id 折叠 {} 次）cached={} stale={} retries={}",
+        "browse {}ms · 1 条查询 · 排除 {} 项 / 要求 {} 项 · 链接 {} 次 → 唯一 id {} · 总条数 {:?} cached={} stale={}",
         stats.browse_ms,
-        occurrences,
-        ids.len(),
-        occurrences.saturating_sub(ids.len()),
-        stats.browse_cached,
-        stats.browse_stale,
-        c.retries
+        q.excluded.len(),
+        q.required.len(),
+        p.occurrences,
+        p.ids.len(),
+        p.total,
+        p.cached,
+        p.stale
     ));
-    Ok(ids)
+    // 真实 URL 打一行进日志（排查"筛选到底发了什么"不用猜；验收脚本也读这一行）
+    wtrace(&format!("browse URL {url}"));
+    Ok(p.ids)
 }
 
 /// 从搜索页 HTML 里抽出工坊条目 ID（保持页面顺序、去重），回 `(唯一 id, 链接出现次数)`。
@@ -696,7 +1485,7 @@ fn completeness(item: &Item) -> u8 {
 }
 
 /// 一次结果的收尾：按 id 折叠 + 记数 + 留一行日志。
-/// `search` / `search_entries` 两条出条目的路都走它，所以"上屏的列表"必然是去重过的。
+/// `search()` / `search_entries()` 两条出条目的路都走它，所以"上屏的列表"必然是去重过的。
 fn finish_items(items: Vec<Item>, stats: &mut Stats) -> Vec<Item> {
     let (kept, dropped) = dedupe_by_id(items);
     stats.duplicates = dropped.len();
@@ -872,7 +1661,7 @@ fn thumbs_cached(items: &[Item], want: usize, stats: &mut Stats) -> Vec<(String,
 /// `on_thumb(id, bytes)`：发现页靠它做「先出条目、缩略图逐张补」的渐进式填充。
 ///
 /// 回调是从 `parallel_map` 的**工作线程**里调的（谁下完谁调），所以必须轻量、非阻塞
-/// 典型的用法是往一个 channel 里 `send`，由 UI 侧把这条消息交给 update。
+/// ——典型的用法是往一个 channel 里 `send`，由 UI 侧把这条消息交给 update。
 /// `None` = 只要最终结果、不要逐张回调（老的一次性路径）。
 fn thumbs_cached_each(
     items: &[Item],
@@ -883,7 +1672,7 @@ fn thumbs_cached_each(
     thumbs_cached_at(&cache_root(), items, want, stats, on_thumb)
 }
 
-/// 同上，但缓存根目录由调用方给（测试用临时目录注入，避免碰全局 `cache_root`）。
+/// 同上，但缓存根目录由调用方给（测试用临时目录注入，避免碰全局 `cache_root()`）。
 fn thumbs_cached_at(
     root: &Path,
     items: &[Item],
@@ -1353,7 +2142,8 @@ mod tests {
     }
 
     /// ⑤ **去重护栏**：同一 id 只留**一条**，且留下的 id 集合 == 原来的 id 集合。
-    /// （登录/订阅整套 UI 已在 删除，角标那条断言随之退场；去重本身仍是
+    ///
+    /// （登录/订阅整套 UI 已在 2026-10-21 删除，角标那条断言随之退场；去重本身仍是
     /// 「上屏列表里同一 id 只出现一次」的保证。）
     #[test]
     fn dedupe_keeps_exactly_one_entry_per_id() {
@@ -1396,6 +2186,729 @@ mod tests {
     fn sort_keys_are_non_empty() {
         for (key, label) in SORTS {
             assert!(!key.is_empty() && !label.is_empty());
+        }
+    }
+
+    // ── 筛选：与 Win 版 WE 面板逐项一致（黑名单取反） ───────────────────────
+    //
+    // 这些用例的"标准答案"不在这里手写：`filter_matches_reversed_spec` 直接读
+    // `artifacts/we-ui-filters-20261022/filters.json`（从 Win 版 WE 的明文面板 + exe
+    // 指针表拓下来的规格），**用另一套独立实现**从 JSON 推出应有的标签集合，再和
+    // 我们生成的 URL 逐组比对。下面那些用例是手感/回归，不承担"和规格一致"的证明。
+
+    /// 六组结构：顺序、小节、选项数、**默认值**都照抄规格（`filters.json`）。
+    #[test]
+    fn filter_groups_match_we_panel_layout() {
+        let keys: Vec<&str> = GROUPS.iter().map(|g| g.key).collect();
+        assert_eq!(
+            keys,
+            vec![G_TYPE, G_RATING, G_RESOLUTION, G_SOURCE, G_TAGS],
+            "组顺序 = WE 面板顺序（仅显示组单独表示）"
+        );
+        // 折叠默认值：类型/年龄分级/分辨率**收起**，来源/标签**展开**
+        let collapsed: Vec<bool> = GROUPS.iter().map(|g| g.collapsed).collect();
+        assert_eq!(collapsed, vec![true, true, true, false, false]);
+
+        // 类型组：两个小节（typetags / categorytags），Application 在工坊默认**不勾**
+        let ty = GROUPS.iter().find(|g| g.key == G_TYPE).unwrap();
+        assert_eq!(ty.sections.len(), 2, "类型 + 分类（分割线）");
+        assert_eq!(ty.sections[0].opts.len(), 4);
+        assert_eq!(ty.sections[1].opts.len(), 2);
+        assert!(!is_real_tag(G_TYPE, "Application") == false, "Application 是真标签");
+        assert!(ty.sections[0].opts.iter().any(|o| o.tag == "Application" && !o.default));
+
+        // 分辨率：5 个宽高比子组（各带所有/无）+ 2 个尾巴，共 23 + 2
+        let res = GROUPS.iter().find(|g| g.key == G_RESOLUTION).unwrap();
+        assert_eq!(res.sections.len(), 6, "5 个子组 + 尾巴");
+        let (all_none, sizes): (Vec<bool>, Vec<usize>) =
+            res.sections.iter().map(|s| (s.all_none, s.opts.len())).unzip();
+        assert_eq!(all_none, vec![true, true, true, true, true, false]);
+        assert_eq!(sizes, vec![6, 3, 4, 5, 5, 2]);
+        assert_eq!(group_opts(G_RESOLUTION).count(), 25);
+        // 3840 x 2160 属于**宽屏**子组，不是独立组；8K 只在语言包里，不是筛选标签
+        assert!(res.sections[0].opts.iter().any(|o| o.tag == "3840 x 2160"));
+        assert!(!is_real_tag(G_RESOLUTION, "7680 x 4320"), "8K 不在筛选数组里");
+        for shorthand in ["4K", "1080p", "1440p", "8K"] {
+            assert!(!is_real_tag(G_RESOLUTION, shorthand), "{shorthand} 不是工坊标签");
+        }
+
+        // 标签组：25 条，可见顺序 Abstract..Vehicle 然后 Unspecified（WE 把 C++ 数组第 0 条挪到末尾）
+        let tg = GROUPS.iter().find(|g| g.key == G_TAGS).unwrap();
+        let tags: Vec<&str> = group_opts(G_TAGS).map(|o| o.tag).collect();
+        assert_eq!(tags.len(), 25);
+        assert_eq!(tags.first().copied(), Some("Abstract"));
+        assert_eq!(tags.last().copied(), Some("Unspecified"));
+        assert!(tg.all_none, "标签组在组头上有「所有/无」");
+        assert!(tg.sections[0].all_none_skip == "Unspecified", "所有/无 跳过 Unspecified");
+
+        // 来源组：纯本地（不发查询参数）；WE 里它只在"已安装"源出现
+        let src = GROUPS.iter().find(|g| g.key == G_SOURCE).unwrap();
+        assert!(!src.query_backed);
+        assert_eq!(group_opts(G_SOURCE).count(), 3);
+    }
+
+    /// **默认状态 = WE 默认筛选**：排除 Application / Questionable / Mature / Unspecified，
+    /// 不往 `requiredtags[]` 里写任何东西（类型/年龄/分辨率/风格从不进白名单）。
+    #[test]
+    fn default_filter_is_the_we_default_query() {
+        let f = Filter::default();
+        assert_eq!(f.changed_count(), 0, "默认状态不该被算成「已筛选」");
+        let q = f.query();
+        assert_eq!(
+            q.excluded,
+            vec![
+                "Application".to_string(),
+                "Mature".to_string(),
+                "Questionable".to_string(),
+                "Unspecified".to_string(),
+            ],
+            "默认只排这四项（排好序）"
+        );
+        assert!(q.required.is_empty(), "默认没有 requiredtags");
+        // 默认勾着的那些确实在"不排除"侧
+        for (g, t) in [
+            (G_TYPE, "Scene"),
+            (G_TYPE, "Wallpaper"),
+            (G_RATING, "Everyone"),
+            (G_RESOLUTION, "3840 x 2160"),
+            (G_TAGS, "Anime"),
+        ] {
+            assert!(f.checked(g, t), "默认应勾着 {g}:{t}");
+        }
+        assert!(!f.checked(G_RATING, "Mature"));
+        assert!(!f.checked(G_TAGS, "Unspecified"));
+    }
+
+    /// 黑名单取反：**勾选 = 不排除**。去勾才进 `excludedtags[]`，勾回来就消失；
+    /// 组内多个 = OR（都在排除表里），组间 = AND（同一条查询里叠加）。
+    #[test]
+    fn query_is_blacklist_inverted_group_or_and_cross_group_and() {
+        let mut f = Filter::default();
+        // 去勾 Anime+Game（同一组两项）⇒ 两个都进排除表（组内 OR：任一即可留下）
+        assert!(!f.toggle(G_TAGS, "Anime"), "点一下 = 去勾");
+        assert!(!f.toggle(G_TAGS, "Game"));
+        let q = f.query();
+        assert!(q.excluded.contains(&"Anime".to_string()));
+        assert!(q.excluded.contains(&"Game".to_string()));
+        assert!(q.required.is_empty(), "风格标签从不进 requiredtags");
+        assert_eq!(q.excluded.len(), 6, "默认 4 + Anime + Game：{q:?}");
+
+        // 再跨一组：去勾 Video、Mature 之外的 Everyone（年龄组换一档）
+        f.toggle(G_TYPE, "Video");
+        f.toggle(G_RATING, "Everyone"); // 去勾 → Everyone 进排除
+        f.toggle(G_RATING, "Mature"); // 勾上 → Mature 从排除表里消失
+        let q = f.query();
+        for t in ["Anime", "Game", "Video", "Everyone"] {
+            assert!(q.excluded.contains(&t.to_string()), "{t} 应被排除: {q:?}");
+        }
+        assert!(!q.excluded.contains(&"Mature".to_string()), "勾上 Mature 后不再排除它");
+        assert!(!q.excluded.contains(&"Scene".to_string()), "Scene 一直勾着");
+
+        // 勾上 Application（WE 默认不勾）⇒ 它从排除表里消失
+        f.toggle(G_TYPE, "Application");
+        assert!(!f.query().excluded.contains(&"Application".to_string()));
+    }
+
+    /// 某组**全不勾** ⇒ 追加字面量 `Unspecified`（否则 Steam 那边等于"不筛"）。
+    /// 粒度 = WE 的"一个 angular 模型对象"：类型的 typetags / categorytags 各算一个，
+    /// 分辨率的 5 个子组 + 尾巴合起来**只算一个**。
+    #[test]
+    fn empty_group_appends_unspecified_fallback() {
+        // 年龄分级全不勾 ⇒ 三个真标签 + 一个 Unspecified
+        let mut f = Filter::default();
+        for tag in ["Everyone", "Questionable", "Mature"] {
+            f.set_checked(G_RATING, tag, false);
+        }
+        let q = f.query();
+        assert_eq!(
+            q.excluded.iter().filter(|t| *t == "Unspecified").count(),
+            1,
+            "空组保底只加一次：{q:?}"
+        );
+        for tag in ["Everyone", "Questionable", "Mature"] {
+            assert!(q.excluded.contains(&tag.to_string()));
+        }
+
+        // 分辨率：只清掉尾巴那两节不够（整组还是一个 map）⇒ **不**额外加 Unspecified
+        let mut g = Filter::default();
+        g.set_section(G_RESOLUTION, "tail", false);
+        let q = g.query();
+        assert!(q.excluded.contains(&"Other resolution".to_string()));
+        assert!(q.excluded.contains(&"Dynamic resolution".to_string()));
+        assert_eq!(
+            q.excluded.iter().filter(|t| *t == "Unspecified").count(),
+            1,
+            "只有标签组那一份默认的 Unspecified，不该多出来：{q:?}"
+        );
+
+        // 分辨率整组全清 ⇒ 25 个标签 + 保底 Unspecified。
+        // 先把标签组的 Unspecified 勾上（否则它本来就在排除表里，看不出保底有没有发生）
+        let mut g = Filter::default();
+        g.set_checked(G_TAGS, "Unspecified", true);
+        assert!(!g.query().excluded.contains(&"Unspecified".to_string()));
+        for section in ["widescreen", "ultrawide", "dual", "triple", "portrait", "tail"] {
+            g.set_section(G_RESOLUTION, section, false);
+        }
+        let q = g.query();
+        assert_eq!(
+            q.excluded.iter().filter(|t| *t == "Unspecified").count(),
+            1,
+            "分辨率整组清空 ⇒ 保底那一个 Unspecified：{q:?}"
+        );
+        assert_eq!(
+            q.excluded.iter().filter(|t| *t == "Other resolution").count(),
+            1,
+            "标签不许重复"
+        );
+    }
+
+    /// 「重置过滤器」= **回到默认**（不是清空）+ 套 `defaultfilterconfig`。
+    #[test]
+    fn reset_restores_default_and_applies_defaultfilterconfig() {
+        let mut f = Filter::default();
+        f.toggle(G_TAGS, "Anime");
+        f.toggle(G_RATING, "Mature");
+        f.toggle(G_TYPE, "Application");
+        f.toggle(G_RESOLUTION, "3840 x 2160");
+        f.toggle_only(ONLY_APPROVED);
+        assert_ne!(f, Filter::default());
+
+        f.reset();
+        assert_eq!(f, Filter::default(), "重置 = 默认筛选，不是「什么都不排」");
+        assert!(f.checked(G_RATING, "Everyone"));
+        assert!(!f.checked(G_RATING, "Mature"));
+        assert!(!f.checked(G_TYPE, "Application"), "重置后 Application 仍不勾");
+        assert_eq!(f.query().excluded.len(), 4);
+
+        // defaultfilterconfig.Anime === false ⇒ 额外排除 Anime/MMD/Girls/Guys/Music
+        let cfg = DefaultFilterConfig {
+            anime: Some(false),
+            ..DefaultFilterConfig::default()
+        };
+        f.reset_with(&cfg);
+        let q = f.query();
+        for tag in ["Anime", "MMD", "Girls", "Guys", "Music"] {
+            assert!(q.excluded.contains(&tag.to_string()), "{tag} 应被排除：{q:?}");
+        }
+        // showotherresolution === false ⇒ 取消 Other resolution
+        let cfg = DefaultFilterConfig {
+            show_other_resolution: false,
+            ..DefaultFilterConfig::default()
+        };
+        f.reset_with(&cfg);
+        assert!(f.query().excluded.contains(&"Other resolution".to_string()));
+        // recommendedresolution 的"推荐集合"逆向没定下来 ⇒ 绝不瞎猜（这一位不许改分辨率）
+        let cfg = DefaultFilterConfig {
+            recommended_resolution: true,
+            ..DefaultFilterConfig::default()
+        };
+        f.reset_with(&cfg);
+        assert_eq!(f, Filter::default(), "未定的规则不许改任何东西");
+    }
+
+    /// 标签组的「所有/无」跳过 `Unspecified`（WE 在工坊源里强制不勾它）。
+    #[test]
+    fn all_none_on_tags_skips_unspecified() {
+        let mut f = Filter::default();
+        f.set_section(G_TAGS, "tags", false);
+        assert!(f.checked(G_TAGS, "Unspecified") == false, "它一直是未勾");
+        // 24 个真标签全排 + 默认那 3 个 + 空组保底 Unspecified
+        let q = f.query();
+        for tag in ["Abstract", "Anime", "Vehicle"] {
+            assert!(q.excluded.contains(&tag.to_string()));
+        }
+        // "无"之后"所有"：24 个回来，Unspecified 仍不勾
+        f.set_section(G_TAGS, "tags", true);
+        let q = f.query();
+        assert!(!q.excluded.contains(&"Abstract".to_string()));
+        assert!(q.excluded.contains(&"Unspecified".to_string()), "它永远不勾");
+    }
+
+    /// 「仅显示」组：Approved 走 `requiredtags[]`；手机兼容额外排除 Application/Web。
+    #[test]
+    fn show_only_writes_the_required_side() {
+        let mut f = Filter::default();
+        assert_eq!(f.toggle_only(ONLY_APPROVED), true);
+        assert_eq!(f.query().required, vec!["Approved".to_string()]);
+        assert_eq!(f.toggle_only(ONLY_APPROVED), false, "再点一下取消");
+        assert!(f.query().required.is_empty());
+
+        f.toggle_only(ONLY_MOBILE);
+        let q = f.query();
+        assert!(q.excluded.contains(&"Application".to_string()));
+        assert!(q.excluded.contains(&"Web".to_string()));
+        assert!(q.excluded.contains(&"Anime".to_string()) == false);
+        // 不认识的 key 不许改状态
+        assert!(!f.toggle_only("nope"));
+        // 假标签 / 假组键：什么都不改（绝不会发 Steam 不认的标签）
+        let before = f.clone();
+        assert!(!f.set_checked("bogus", "Anime", false));
+        assert!(!f.set_checked(G_TAGS, "NotARealGenre", false));
+        assert_eq!(f, before);
+    }
+
+    /// URL 形状：`requiredtags[]` / **`excludedtags[]`** 都用 `%5B%5D` 编码，
+    /// 值用 `%20` 编码；搜索词/排序/页码**一起带上**（不能因为加筛选就弄丢）。
+    #[test]
+    fn browse_url_carries_search_sort_page_and_encoded_tags() {
+        let mut f = Filter::default();
+        f.toggle(G_RESOLUTION, "3840 x 2160"); // 去勾 → 排除（值里的空格要编码）
+        f.toggle_only(ONLY_APPROVED); // required 侧
+        let url = browse_url("夜空", 3, "toprated", &f.query());
+        assert!(url.contains("appid=431960"), "{url}");
+        assert!(url.contains("section=readytouseitems"));
+        assert!(url.contains("browsesort=toprated"), "排序不能被筛选顶掉：{url}");
+        assert!(url.contains("p=3"), "页码要带上：{url}");
+        assert!(url.contains("numperpage=30"));
+        assert!(url.contains("searchtext=%E5%A4%9C%E7%A9%BA"), "搜索词要带上：{url}");
+        assert!(
+            url.contains("excludedtags%5B%5D=3840%20x%202160"),
+            "分辨率标签里的空格要编码：{url}"
+        );
+        assert!(url.contains("requiredtags%5B%5D=Approved"), "{url}");
+        // 默认筛选 ⇒ 只有 excludedtags，没有 requiredtags，也没有 searchtext
+        let plain = browse_url("", 1, "trend", &Filter::default().query());
+        assert!(!plain.contains("requiredtags"), "{plain}");
+        assert!(!plain.contains("searchtext"), "空关键词不该出现 searchtext：{plain}");
+        assert!(plain.contains("excludedtags%5B%5D=Application"));
+        assert!(!plain.contains("excludedtags%5B%5D=Anime"), "{plain}");
+    }
+
+    /// 持久化：只写**与默认不同**的项，`组键:标签=1|0`；空表 = 默认；脏行丢掉。
+    #[test]
+    fn filter_round_trips_through_config_lines() {
+        // 默认状态 ⇒ 零行（空表 = 默认，不是"不筛"）
+        assert!(Filter::default().to_lines().is_empty());
+
+        let mut f = Filter::default();
+        f.toggle(G_TAGS, "Anime"); // 去勾
+        f.toggle(G_TYPE, "Application"); // 勾上（默认是不勾的）
+        f.toggle_only(ONLY_APPROVED);
+        let lines = f.to_lines();
+        assert_eq!(lines.len(), 3, "只写差异：{lines:?}");
+        assert!(lines.contains(&format!("{G_TAGS}:Anime=0")), "{lines:?}");
+        assert!(lines.contains(&format!("{G_TYPE}:Application=1")), "{lines:?}");
+        assert!(lines.contains(&format!("only:{ONLY_APPROVED}=1")), "{lines:?}");
+        assert_eq!(Filter::from_lines(&lines), f, "写出去再读回来必须一模一样");
+
+        // 脏数据：不认识的组、不是真标签、没有状态位（旧格式）、怪状态位 —— 全丢，
+        // 但**不许把整个筛选搞坏**（剩下的照常生效）
+        let dirty = vec![
+            format!("{G_TAGS}:Anime=0"),
+            "bogus:Anime=0".to_string(),
+            format!("{G_TAGS}:NotARealGenre=0"),
+            "没有等号".to_string(),
+            format!("{G_RESOLUTION}:3840 x 2160=2"),
+            format!("only:nope=1"),
+        ];
+        let cleaned = Filter::from_lines(&dirty);
+        assert!(!cleaned.checked(G_TAGS, "Anime"), "唯一一行合法配置要生效");
+        assert_eq!(cleaned.changed_count(), 1, "{cleaned:?}");
+        // 空配置 = WE 默认（而不是"什么都不排除"）
+        assert_eq!(Filter::from_lines(&[]), Filter::default());
+    }
+
+    /// **验收主用例**：直接读逆向规格 `filters.json`，用**另一套独立实现**推出应有的
+    /// 标签集合，再和我们生成的 URL 逐组比对（排序后必须完全相同）。
+    ///
+    /// 没有规格文件就跳过（OSS 仓/别的机器不该因此变红）。
+    #[test]
+    fn filter_matches_reversed_spec() {
+        let Some(spec) = load_we_filter_spec() else {
+            eprintln!("没有 filters.json ⇒ 跳过规格对比（只在带 artifacts 的开发树里跑）");
+            return;
+        };
+        // ① 词表与默认值：对我们每组每个选项逐条比
+        let ours = spec_ours();
+        assert_eq!(ours.len(), 4, "会进查询的是四组（类型/年龄/分辨率/标签）");
+        for (key, mine) in &ours {
+            let s = spec_group(&spec, key).expect("规格里应有这一组");
+            assert_eq!(
+                mine.tags, s.tags,
+                "{key} 组的 tag 集合/顺序必须与逆向规格一致"
+            );
+            assert_eq!(
+                mine.defaults, s.defaults,
+                "{key} 组的默认勾选必须与逆向规格的 workshop 默认值一致"
+            );
+            // 逐组对比表（`--nocapture` 时打印，可直接贴进报告）
+            let on = mine.defaults.iter().filter(|d| **d).count();
+            let mut a = mine.tags.clone();
+            let mut b = s.tags.clone();
+            a.sort();
+            b.sort();
+            eprintln!(
+                "  {key:10} 规格 {:>2} 项 / 我们 {:>2} 项 · 默认勾选 {}/{} · tag 集合相等 {}",
+                s.tags.len(),
+                mine.tags.len(),
+                on,
+                mine.tags.len(),
+                a == b
+            );
+        }
+
+        // ② 查询：几种典型状态，与我们**独立**从 JSON 推出来的集合比
+        let cases: Vec<(&str, Vec<(&str, &str)>, bool)> = vec![
+            // 默认状态
+            ("默认", vec![], false),
+            // 组内多选（同一组去勾两项 = OR）
+            ("组内 Anime+Game", vec![(G_TAGS, "Anime"), (G_TAGS, "Game")], false),
+            // 组间组合（类型 + 标签 各去勾一项 = AND）
+            (
+                "组间 Video + Anime",
+                vec![(G_TYPE, "Video"), (G_TAGS, "Anime")],
+                false,
+            ),
+            // 空组保底：整组年龄分级都不勾
+            (
+                "空组（年龄全不勾）",
+                vec![
+                    (G_RATING, "Everyone"),
+                    (G_RATING, "Questionable"),
+                    (G_RATING, "Mature"),
+                ],
+                false,
+            ),
+            // 分辨率子组"无" + 标签组"无"
+            ("分辨率尾巴全不勾", vec![(G_RESOLUTION, "Other resolution"), (G_RESOLUTION, "Dynamic resolution")], false),
+            // 仅显示侧（requiredtags）
+            ("仅显示 Approved", vec![], true),
+        ];
+
+        for (name, unchecked, approved) in cases {
+            let mut f = Filter::default();
+            for (g, t) in &unchecked {
+                assert!(f.set_checked(g, t, false), "{g}:{t} 应该是真标签");
+            }
+            if approved {
+                f.set_only(ONLY_APPROVED, true);
+            }
+            let q = f.query();
+
+            // 独立实现：规格侧从 JSON 重建同样的状态，再推导 excluded 集合
+            let want = spec_expected_excluded(&spec, &unchecked);
+            let mut got = q.excluded.clone();
+            let mut want = want;
+            got.sort();
+            want.sort();
+            eprintln!(
+                "  {name:24} 规格推导 {} 项 / 我们 {} 项 · 集合相等 {}",
+                want.len(),
+                got.len(),
+                got == want
+            );
+            assert_eq!(got, want, "【{name}】excludedtags 集合必须与规格推导完全一致");
+
+            // 再核一遍 URL 上的真实参数（不只是内存里的 Vec）
+            let url = browse_url("", 1, "trend", &q);
+            let mut url_tags = url_param_values(&url, "excludedtags%5B%5D=");
+            url_tags.sort();
+            assert_eq!(url_tags, want, "【{name}】URL 里的 excludedtags 必须与规格推导一致");
+
+            // requiredtags 侧：规格说只有 Approved / utility 会进
+            let want_req: Vec<String> = if approved {
+                vec!["Approved".to_string()]
+            } else {
+                vec![]
+            };
+            assert_eq!(q.required, want_req, "【{name}】requiredtags 侧");
+            let url_req = url_param_values(&url, "requiredtags%5B%5D=");
+            assert_eq!(url_req, want_req, "【{name}】URL 里的 requiredtags");
+        }
+
+        // ③ "重置"之后必须回到 ①:默认状态（与规格默认值逐项一致）
+        let mut f = Filter::default();
+        f.set_section(G_TAGS, "tags", false);
+        f.set_section(G_RESOLUTION, "widescreen", false);
+        f.set_only(ONLY_MOBILE, true);
+        f.reset();
+        assert_eq!(f, Filter::default(), "重置 = 回到规格里的默认值");
+    }
+
+    /// 从规格 JSON 读出来的"我们这一侧"的形状（测试内部用）。
+    struct SpecTags {
+        tags: Vec<String>,
+        defaults: Vec<bool>,
+    }
+
+    /// `filters.json` 的路径（开发树里在 `artifacts/`；可用 `WPHUB_WE_FILTERS_SPEC` 覆盖）。
+    fn load_we_filter_spec() -> Option<Value> {
+        let mut candidates: Vec<PathBuf> = Vec::new();
+        if let Ok(p) = std::env::var("WPHUB_WE_FILTERS_SPEC") {
+            candidates.push(PathBuf::from(p));
+        }
+        candidates.push(PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../artifacts/we-ui-filters-20261022/filters.json"
+        )));
+        candidates.push(PathBuf::from(
+            "/home/dev/artifacts/we-ui-filters-20261022/filters.json",
+        ));
+        for path in candidates {
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                match serde_json::from_str(&text) {
+                    Ok(v) => return Some(v),
+                    Err(e) => eprintln!("{} 解析失败：{e}", path.display()),
+                }
+            }
+        }
+        None
+    }
+
+    /// 规格里某一组的 `(tag 列表, workshop 默认勾选)`。
+    ///
+    /// 刻意**不复用**我们的 `GROUPS`：从 JSON 里按规格的结构（type.options +
+    /// type.second_section.options / resolution.subgroups + ungrouped_options / …）自己拼。
+    fn spec_group(spec: &Value, key: &str) -> Option<SpecTags> {
+        let groups = spec.get("groups")?.as_array()?;
+        let g = groups
+            .iter()
+            .find(|g| g.get("id").and_then(|v| v.as_str()) == Some(key))?;
+        let mut tags = Vec::new();
+        let mut defaults = Vec::new();
+        let mut push = |o: &Value| {
+            tags.push(o.get("tag")?.as_str()?.to_string());
+            // workshop_default 优先（工坊源），否则 default
+            let d = o
+                .get("workshop_default")
+                .or_else(|| o.get("default"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            defaults.push(d);
+            Some(())
+        };
+        if key == G_RESOLUTION {
+            // 23 个按 5 个子组的顺序，然后两个尾巴
+            for sg in g.get("subgroups")?.as_array()? {
+                for o in sg.get("options")?.as_array()? {
+                    push(o)?;
+                }
+            }
+            for o in g.get("ungrouped_options")?.as_array()? {
+                push(o)?;
+            }
+        } else if key == G_TYPE {
+            for o in g.get("options")?.as_array()? {
+                push(o)?;
+            }
+            for o in g.get("second_section")?.get("options")?.as_array()? {
+                push(o)?;
+            }
+        } else {
+            for o in g.get("options")?.as_array()? {
+                push(o)?;
+            }
+        }
+        // 规格里标签组的顺序是 C++ 数组顺序（Unspecified 在开头），WE 渲染时把它挪到末尾
+        if key == G_TAGS {
+            if let Some(pos) = tags.iter().position(|t| t == "Unspecified") {
+                let (t, d) = (tags.remove(pos), defaults.remove(pos));
+                tags.push(t);
+                defaults.push(d);
+            }
+        }
+        Some(SpecTags { tags, defaults })
+    }
+
+    /// 我们这一侧的同一份形状（只比会进查询的四组；来源组是纯本地、规格里也没默认值）。
+    fn spec_ours() -> Vec<(&'static str, SpecTags)> {
+        GROUPS
+            .iter()
+            .filter(|g| g.query_backed)
+            .map(|g| {
+                (
+                    g.key,
+                    SpecTags {
+                        tags: group_opts(g.key).map(|o| o.tag.to_string()).collect(),
+                        defaults: group_opts(g.key).map(|o| o.default).collect(),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// **独立实现**：从规格 JSON 推导"这些项没勾"时该有的 `excludedtags` 集合。
+    ///
+    /// 保底粒度按规格的 angular 模型对象算：typetags / categorytags / ratingtags /
+    /// resolutiontags(23+2) / tags 各一个。
+    fn spec_expected_excluded(spec: &Value, unchecked: &[(&str, &str)]) -> Vec<String> {
+        let is_unchecked = |g: &str, t: &str| unchecked.iter().any(|(gg, tt)| *gg == g && *tt == t);
+        let mut out: BTreeSet<String> = BTreeSet::new();
+        // 每个单元：组的持久化键 + 规格里属于这个单元的 tag（带默认值）
+        let mut units: Vec<(&str, Vec<(String, bool)>)> = Vec::new();
+        for g in spec.get("groups").and_then(|v| v.as_array()).cloned().unwrap_or_default() {
+            let id = g.get("id").and_then(|v| v.as_str()).unwrap_or("");
+            let key = if id == "type(+category)" || id == "type" {
+                G_TYPE
+            } else {
+                match id {
+                    "rating" => G_RATING,
+                    "resolution" => G_RESOLUTION,
+                    "tags" => G_TAGS,
+                    _ => continue, // show_only / source 不进 excludedtags 的可勾选单元
+                }
+            };
+            let read = |arr: Option<&Vec<Value>>| -> Vec<(String, bool)> {
+                arr.map(|a| {
+                    a.iter()
+                        .filter_map(|o| {
+                            let t = o.get("tag")?.as_str()?.to_string();
+                            let d = o
+                                .get("workshop_default")
+                                .or_else(|| o.get("default"))
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(true);
+                            Some((t, d))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+            };
+            match id {
+                "resolution" => {
+                    // 5 个子组 + 尾巴 = **一个**单元
+                    let mut all = Vec::new();
+                    if let Some(sgs) = g.get("subgroups").and_then(|v| v.as_array()) {
+                        for sg in sgs {
+                            all.extend(read(sg.get("options").and_then(|v| v.as_array())));
+                        }
+                    }
+                    all.extend(read(g.get("ungrouped_options").and_then(|v| v.as_array())));
+                    units.push((key, all));
+                }
+                "type" | "type(+category)" => {
+                    // typetags 与 categorytags 是**两个**单元
+                    units.push((key, read(g.get("options").and_then(|v| v.as_array()))));
+                    units.push((
+                        key,
+                        read(
+                            g.get("second_section")
+                                .and_then(|s| s.get("options"))
+                                .and_then(|v| v.as_array()),
+                        ),
+                    ));
+                }
+                _ => units.push((key, read(g.get("options").and_then(|v| v.as_array())))),
+            }
+        }
+
+        for (key, opts) in units {
+            let mut any_checked = false;
+            for (t, default_on) in opts {
+                let on = default_on && !is_unchecked(key, &t);
+                if on {
+                    any_checked = true;
+                } else {
+                    out.insert(t);
+                }
+            }
+            if !any_checked {
+                out.insert(UNSPECIFIED_FALLBACK.to_string());
+            }
+        }
+        out.into_iter().collect()
+    }
+
+    /// 从 URL 里取出某个参数的所有值（百分号解码 `%20`/`%5B%5D` 之外的常规转义）。
+    fn url_param_values(url: &str, prefix: &str) -> Vec<String> {
+        url.split('&')
+            .filter_map(|kv| kv.strip_prefix(prefix))
+            .map(|v| {
+                v.replace("%20", " ")
+                    .replace("%5B%5D", "[]")
+                    .replace("%2F", "/")
+            })
+            .collect()
+    }
+
+    /// **真网络验收**（默认跳过）：把每种筛选状态的 URL 真打一次 Steam，印出
+    /// `excludedtags` 集合 + `total_count`（= 筛选真的生效的硬证据）。
+    ///
+    /// 开法：`WPHUB_LIVE_FILTER=1 WPHUB_WORKSHOP_CACHE_DIR=… cargo test --release \
+    ///        live_filter_urls -- --nocapture`（会走 `fetch_browse_page`，即产品代码那条路）
+    #[test]
+    fn live_filter_urls_against_steam() {
+        if std::env::var("WPHUB_LIVE_FILTER").ok().as_deref() != Some("1") {
+            eprintln!("跳过真网络验收（WPHUB_LIVE_FILTER=1 才跑）");
+            return;
+        }
+        // (名字, 先去勾哪些项, 勾不勾 Approved, 最后是否点「重置过滤器」)
+        let scenarios: Vec<(&str, Vec<(&str, &str)>, bool, bool)> = vec![
+            ("① 默认（= WE 默认）", vec![], false, false),
+            (
+                "② 乱改一通后点「重置过滤器」",
+                vec![(G_TAGS, "Anime"), (G_TYPE, "Application"), (G_RATING, "Mature")],
+                true,
+                true,
+            ),
+            ("③ 单组取消一项 tags:Anime", vec![(G_TAGS, "Anime")], false, false),
+            (
+                "④ 组内多选 Anime+Game",
+                vec![(G_TAGS, "Anime"), (G_TAGS, "Game")],
+                false,
+                false,
+            ),
+            (
+                "⑤ 组间 Video+Anime",
+                vec![(G_TYPE, "Video"), (G_TAGS, "Anime")],
+                false,
+                false,
+            ),
+            (
+                "⑥ 分辨率·宽屏=无",
+                vec![
+                    (G_RESOLUTION, "Standard Definition"),
+                    (G_RESOLUTION, "1280 x 720"),
+                    (G_RESOLUTION, "1366 x 768"),
+                    (G_RESOLUTION, "1920 x 1080"),
+                    (G_RESOLUTION, "2560 x 1440"),
+                    (G_RESOLUTION, "3840 x 2160"),
+                ],
+                false,
+                false,
+            ),
+            (
+                "⑦ 空组（年龄全不勾）",
+                vec![
+                    (G_RATING, "Everyone"),
+                    (G_RATING, "Questionable"),
+                    (G_RATING, "Mature"),
+                ],
+                false,
+                false,
+            ),
+            ("⑧ 仅显示 Approved", vec![], true, false),
+        ];
+        eprintln!("── 真网络：每条 URL 打一次 Steam（缓存目录 {}）", cache_root().display());
+        for (name, unchecked, approved, reset_last) in scenarios {
+            let mut f = Filter::default();
+            for (g, t) in &unchecked {
+                f.set_checked(g, t, false);
+            }
+            if approved {
+                f.set_only(ONLY_APPROVED, true);
+            }
+            if reset_last {
+                // WE 的「重置过滤器」：回到默认 + 套 defaultfilterconfig
+                f.reset();
+                assert_eq!(f, Filter::default(), "重置后必须等于 WE 默认筛选");
+            }
+            let q = f.query();
+            let url = browse_url("", 1, "trend", &q);
+            let shown = url.replace("%5B%5D", "[]").replace("%20", " ");
+            let outcome = fetch_browse_page(&url);
+            match outcome {
+                Ok(p) => eprintln!(
+                    "{name}\n  URL {shown}\n  excluded {} 项 → total_count={:?} · 本页 id {}",
+                    q.excluded.len(),
+                    p.total,
+                    p.ids.len()
+                ),
+                Err(e) => {
+                    eprintln!("{name}\n  URL {shown}\n  请求失败：{e}");
+                    panic!("真网络验收失败：{e}");
+                }
+            }
         }
     }
 
@@ -1662,7 +3175,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// `want` 决定最多下几张 —— 界面要"30 条全都要"就传 `items.len`。
+    /// `want` 决定最多下几张 —— 界面要"30 条全都要"就传 `items.len()`。
     #[test]
     fn streaming_respects_want_ceiling() {
         let root = tmp_root("stream-want");
@@ -1766,6 +3279,8 @@ mod tests {
             concurrency: cfg::WS_THUMB_CONCURRENCY,
             browse_cached: false,
             browse_stale: false,
+            queries: 1,
+            total_count: None,
         };
         let text = describe_stats(&stats);
         for needle in ["6300ms", "1750ms", "1900ms", "2650ms", "失败 1", "失败 2", "重试 1"] {
@@ -1775,6 +3290,23 @@ mod tests {
         assert!(text.contains("链接 60 次"), "{text}");
         assert!(text.contains("唯一 id 30"), "{text}");
         assert!(text.contains("同 id 折叠 0"), "{text}");
+        // 单组合 + 没有 total_count ⇒ 不印这两项（不制造噪声）
+        assert!(!text.contains("筛选组合"), "{text}");
+        assert!(!text.contains("工坊总条数"), "{text}");
+    }
+
+    /// 摘要里必须**看得见**"Steam 报的总条数" —— 这就是验收里"筛选真的生效了"的证据
+    /// （默认筛选 1 960 215 条 vs 无筛选 2 923 776 条，见 REPORT 与本轮实测）。
+    #[test]
+    fn stats_summary_shows_total_count() {
+        let stats = Stats {
+            queries: 1,
+            total_count: Some(1_960_215),
+            ..Stats::default()
+        };
+        let text = describe_stats(&stats);
+        assert!(text.contains("工坊总条数 1960215"), "{text}");
+        assert!(!text.contains("筛选组合"), "一页只发一条查询，不再印组合数：{text}");
     }
 
     #[test]

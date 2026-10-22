@@ -1,5 +1,7 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: GPL-3.0-only
+//
 // Wallpaper Hub —— COSMIC 原生壁纸中继客户端
+//
 // 渲染由**自研内核**（`we-native`，systemd 用户服务）负责，本程序只做「控制面 + 界面」：
 // 直接扫工坊目录拿列表，通过内核的 Unix socket 控制面下发应用/暂停/设置指令。
 // 历史上的 waywallen（独立 flatpak 守护进程 + WebSocket protobuf）已整体移除。
@@ -48,19 +50,21 @@ pub struct AppModel {
     native: Option<native::Status>,
     /// 最近一次内核操作的说明（成功/失败都给一句人话）
     /// 最近一次动作的提示（"已生效 …" 这类）。
-    /// ⚠ 目前**界面上没有常显位置**：角落那行只放资源占用，
+    /// ⚠ 目前**界面上没有常显位置**：角落那行只放资源占用（用户的明确要求），
     /// 而这句话不会自己消失 ⇒ 塞哪儿都会长期占着。留着等以后做 toast/自动消失再显示。
     #[allow(dead_code)]
     native_note: Option<String>,
-    /// 桌面现在由谁在画：true = 自研内核。保留字段只为兼容旧配置（外部 daemon 后端已移除）。
+    /// 桌面现在由谁在画：false = waywallen（默认），true = 自研内核
     backend_native: bool,
     /// 最近一次下发给内核的（kind, path），切回来时重新下发（内核懒创建表面）
     native_last: Option<(String, String)>,
     /// 内核最近一次 `set` 回执里的四项（界面拿它显示"内核当前值"）
     kernel_perf: Option<(u64, String, String, String)>,
     /// **逐场景帧率表**（`~/.local/share/wallpaper-hub/scene_fps.json`）：壁纸 id → fps。
-    /// 起帧率不再有全局档：表里有记录就用它，没有就用 [`config::SCENE_FPS_DEFAULT`]（60）。
+    ///
+    /// 2026-10-14 起帧率不再有全局档：表里有记录就用它，没有就用 [`config::SCENE_FPS_DEFAULT`]（60）。
     /// 这就是"重场景 30、轻场景 60"能同时成立的原因（见 `config::fps_for_scene` 的头注释）；
+    /// 也让"每次应用都被盖成 30"这个病根彻底消失。
     scene_fps: BTreeMap<String, u64>,
     /// 自适应状态：本场景连续几次实测"明显跑不到"（见 `config::adapt_step`）。
     adapt_streak: u8,
@@ -97,11 +101,13 @@ pub struct AppModel {
     /// 内核无状态（重启后不记得界面设过什么）⇒ 连上就先补发一次，靠它保证只补发一次。
     perf_synced: bool,
     /// 连上内核时是否允许**自动推进「上次应用」**（`native_last`）。
+    ///
     /// 由 `Config::auto_apply_last`（默认 true）与 `--no-auto-apply` / `WPHUB_NO_AUTO_APPLY=1`
     /// 共同决定；**只有内核空闲（没在播 / 没内容）时才真的会推**，内核正在播的一律不动
     /// （内核是权威 —— 见纯函数 [`decide_auto_apply`]）。
     auto_apply_enabled: bool,
     /// 属性覆盖表**落盘**的节流状态：`(有未落的改动, 上次落盘时刻)`。
+    ///
     /// 拖动色盘时 `set_prop` 每帧都被调一次，若每次都 `fs::write` 整个覆盖表就是白扔
     /// IO（每帧一次小文件写）。这里改成"最多 4 次/秒 + 松手必落"（见 [`AppModel::persist_props`]）。
     /// 3 秒一次的 status 轮询顺带补一次，保证"最后一下没松手"也不会丢。
@@ -140,7 +146,7 @@ pub struct AppModel {
     discover_thumb_raw: HashMap<String, Vec<u8>>,
     discover_loading: bool,
     /// 上一次搜索**页面里** `filedetails/?id=` 链接的出现次数（含重复）。
-    /// 与 `discover_items.len` 一起显示，就是为了把"页面里同一 id 出现两次"（Steam 常态，
+    /// 与 `discover_items.len()` 一起显示，就是为了把"页面里同一 id 出现两次"（Steam 常态，
     /// 每条两处链接）和"上屏列表里同一 id 出现两次"（**不许发生**）分清楚。
     discover_links: usize,
     /// 上屏前按 id 折叠掉的重复条数（`workshop::dedupe_by_id`；正常 0）
@@ -154,12 +160,44 @@ pub struct AppModel {
     discover_error: Option<String>,
     discover_page: u32,
     discover_sort: usize,
+    /// 工坊页筛选，**与 Win 版 WE 面板同构**（6 组 / 黑名单取反 / 默认值照抄；
+    /// 语义见 `workshop::Filter::query`）。持久化见 `Config::workshop_filter_state`。
+    discover_filter: workshop::Filter,
+    /// 「筛选」区是否展开（收起也记住 ⇒ 重启后还是上次那个样子）
+    discover_filter_open: bool,
+    /// 每一组现在是**展开**吗（`true` = 展开）。没记录的组用 `Group::collapsed`
+    /// 那个默认值（类型/年龄分级/分辨率收起，来源/标签展开 —— 和 WE 一致）。
+    /// 只存活于本次会话：WE 也只持久化筛选**值**，不持久化折叠态。
+    filter_collapsed: BTreeMap<String, bool>,
+    /// 筛选防抖的状态机（代数 + 放行次数）：每勾一次 +1，300ms 后到的那条定时消息只有
+    /// 代数仍相等才放行 ⇒ 连点 5 次只发**最后一次**请求（窗口见 `cfg::WS_FILTER_DEBOUNCE_MS`）。
+    /// 抽成 [`FilterDebounce`] 是为了让"5 次点击 → 1 次放行"这件事能被单测断言。
+    filter_debounce: FilterDebounce,
+    /// 真正跑过几次工坊搜索（每个搜索入口 +1）。与 `filter_releases` 一起印出来，
+    /// 就能一眼看出"5 次点击 → 1 次放行 → 1 次搜索"这条链，而不会把**重试**误读成
+    /// "又搜了一次"（重试发生在一次搜索内部，见 `workshop::Stats::retries`）。
+    filter_searches: usize,
+    /// 上一次放行那一刻的 `workshop::browse_fetch_count()`；搜索回来时相减 =
+    /// 这一次筛选真实打了 Steam 几次（组合多选时 > 1）
+    filter_fetch_mark: u64,
+    /// 上一次搜索结果里 Steam 报的**工坊总条数**（筛选生效的硬证据，界面显示"共 N 条"）
+    discover_total: Option<u64>,
+    /// 上一次搜索发了几个 browse 组合（多选时 > 1）
+    discover_queries: usize,
+    /// **脚本化拖动**（只给验收用）：本机是 Wayland，没有输入模拟工具，点不动 UI 滑杆。
+    /// 这条会按 10 ms 一拍、把同一个 `Message::TimeScaleSet/MusicVolumeSet` 连续喂进来
+    /// （= 真拖动时滑杆回调喂的那条），从而走**完全相同**的 update → 出站队列 → 内核 链路。
+    /// `None` = 没在脚本拖动。
+    drag: Option<Drag>,
+    /// 脚本化拖动的**起始时刻**（`WPHUB_DRAG_DELAY_MS`，默认 0）：给第一屏缩略图解码留时间，
+    /// 否则拖动那 1.2 秒会撞在 UI 线程最忙的时候（那不是节流该量的东西）。
+    drag_start: Option<std::time::Instant>,
     /// 只给截图用：`--workshop-select <工坊id>` —— 发现页结果回来后选中这条
     /// （= 点一下缩略图，走**完全相同**的 `Message::SelectWorkshop`）。本机没有输入模拟工具。
     pending_workshop_select: Option<String>,
-    /// 卡片尺寸档。
+    /// 卡片尺寸档（小/中/大 三档，见 [`CARD_SIZES`]；默认中 = 280×158，= 上一轮的「大」）。
     /// 只影响**渲染尺寸**，不落盘 —— 换了档立刻按新宽度重排（列数/行数都跟着窗口算），
-    /// 因此**重启后仍回到「中」**。
+    /// 因此**重启后仍回到「中」**（用户要求：不能每次弹回小）。
     card_idx: usize,
     /// 内核**播放速度**（场景时间倍率，0.25..3.0，默认 1.0）。滑杆拖动时每帧变一次，
     /// 出站队列按 key 合并 + 55 ms 节流（≤18 Hz），松手 `SliderRelease` 立刻放行终值。
@@ -181,7 +219,7 @@ pub struct AppModel {
     /// 属性面板里当前展开取色的属性键
     open_color: Option<String>,
     /// 只给截图用（`--open-color <键>`）：**第一次**选中壁纸时把这条属性展开成色盘，
-    /// 之后照常收起（`take` ⇒ 一次性）。
+    /// 之后照常收起（`take()` ⇒ 一次性）。
     pending_open_color: Option<String>,
     /// 逐壁纸属性覆盖：id → (键 → 值)。
     /// **数据驱动**：键与类型全部来自 `project.json` 的 `general.properties`
@@ -214,7 +252,7 @@ pub struct AppModel {
     /// 预览图尺寸缓存（选中时算一次，状态条显示用；不每帧读文件）
     dims: HashMap<String, (u32, u32)>,
     /// 面板顶部大图**实际用的文件**（id → 路径）。默认就是封面；包内若有
-    /// **像素比封面更大**的本地图（`select` 时扫一遍目录）则记成那张 —— 见「优先用大图」。
+    /// **像素比封面更大**的本地图（`select()` 时扫一遍目录）则记成那张 —— 见「优先用大图」。
     preview_src: HashMap<String, PathBuf>,
     /// 上面那张大图的**原始像素**（id → (w,h)）。显示尺寸按它算：**不放大**超过这个像素。
     /// 与 `dims`（封面 preview 的尺寸，缩略图 chips 显示用）分开存，别混。
@@ -233,6 +271,7 @@ pub struct AppModel {
 }
 
 /// 一张已经能上屏的宣传图：句柄 + 原始像素尺寸。
+///
 /// 尺寸在**插入时**量好（`image::image_dimensions` / `ImageReader::into_dimensions` 只读文件头），
 /// 界面每帧只做一次比例计算 —— 不每帧解码整张图。
 #[derive(Clone)]
@@ -240,6 +279,19 @@ struct PromoImg {
     handle: widget::image::Handle,
     w: u32,
     h: u32,
+}
+
+/// 脚本化拖动（`--drag-time-scale from:to[:steps]` / `--drag-volume from:to[:steps]`）。
+///
+/// 只存在于**验收路径**上：每 10 ms 一拍推进一个值，和真拖动时滑杆回调产生的消息**同一条**。
+#[derive(Debug, Clone)]
+struct Drag {
+    /// 0 = 播放速度；1 = 场景音频音量
+    knob: u8,
+    from: f32,
+    to: f32,
+    steps: u32,
+    i: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -308,6 +360,25 @@ pub enum Message {
     DiscoverThumbsDone(Box<Option<workshop::Stats>>),
     DiscoverSortCycle,
     DiscoverNextPage,
+    /// 展开/收起工坊页的「筛选」区（纯 UI，不触发搜索 ⇒ 无防抖问题）
+    DiscoverFilterToggle,
+    /// 勾上/去勾一个筛选项：`(组键, 工坊标签原文)`。**勾选 = 不排除**（WE 语义）。
+    /// 只走 [真标签]（组键/标签不在 `workshop::GROUPS` 里就不改任何状态），并且
+    /// **不立刻搜索** —— 300ms 防抖后由 `DiscoverFilterDebounce` 放行（连点 5 次只发 1 次请求）。
+    DiscoverFilterToggleTag(String, String),
+    /// 「仅显示」组里的一项（`workshop::ONLY_APPROVED` / `ONLY_MOBILE`）——
+    /// 这一组的勾选**不是**黑名单：Approved 进 `requiredtags[]`，手机兼容额外排除两项。
+    DiscoverFilterToggleOnly(String),
+    /// 某小节的「所有 / 无」：`(组键, 小节键, 是否全勾)`。
+    /// 分辨率那 5 个宽高比子组各一对、标签组一对、类型组那两小节也可用。
+    DiscoverFilterAllNone(String, String, bool),
+    /// 展开/收起某一组（纯 UI，不触发搜索 ⇒ 无防抖问题）
+    DiscoverFilterCollapse(String),
+    /// **重置为 WE 默认筛选**（不是清空！）+ 套 `defaultfilterconfig`。
+    /// 同样走防抖，不立刻打网络。
+    DiscoverFilterReset,
+    /// 防抖定时器到点：`gen` 与当前代数一致才真的去搜（否则说明用户又点了一下，作废）
+    DiscoverFilterDebounce(u64),
     /// 选中一条**没有下载到本地**的工坊条目：右侧面板显示工坊信息 + 工坊页链接（**不跳网页**）
     SelectWorkshop(String),
     /// 宣传图：后台下好一张（壁纸 id + 清单下标 + 原始字节）
@@ -377,12 +448,15 @@ pub enum Message {
     MusicVolumeSet(f32),
     /// 任一滑杆**松手**：立刻放行出站队列里的终值（不等节流窗口）
     SliderRelease,
+    /// 脚本化拖动：推进下一拍（10 ms）
+    DragTick,
 
     // 设置页：切换标签
 
 }
 
 // ── 调试：每秒统计各类 Message（`WPHUB_MSG_STATS=1` 打开；默认关、零开销）──────
+//
 // 用来定位「空闲时主线程为什么还在烧 CPU」：把每秒进来的消息按类型打一行。
 // 空闲 100% 的根因（NativeReply 回执无条件再发一次 status ⇒ 自我循环）就是
 // 靠它一眼看出来的：那一行里 NativeReply 有 ~8000/秒。
@@ -467,6 +541,7 @@ fn msg_name(m: &Message) -> &'static str {
         Message::PropsReset => "PropsReset",
         Message::ToggleColorPicker(_) => "ToggleColorPicker",
         Message::AudioSinkSet(_) => "AudioSinkSet",
+        Message::DragTick => "DragTick",
         Message::RestartKernel => "RestartKernel",
         _ => "其它",
     }
@@ -476,11 +551,11 @@ fn msg_stats_bump(m: &Message) {
     MSG_COUNTS[msg_bucket(m)].fetch_add(1, Ordering::Relaxed);
 }
 
-/// 单次 `update` 的**最坏耗时**（微秒）—— 用来回答"UI 到底卡没卡"：
+/// 单次 `update()` 的**最坏耗时**（微秒）—— 用来回答"UI 到底卡没卡"：
 /// 只要它远小于一帧（60fps = 16.7ms），用户就感觉不到卡顿。
 static UPD_MAX_US: AtomicU64 = AtomicU64::new(0);
 
-/// 放在 `update` 门口；靠 Drop 记录耗时（早退分支也能记上）。
+/// 放在 `update()` 门口；靠 Drop 记录耗时（早退分支也能记上）。
 struct UpdateTimer(std::time::Instant);
 
 impl Drop for UpdateTimer {
@@ -524,13 +599,15 @@ impl cosmic::Application for AppModel {
         &mut self.core
     }
 
-    /// 窗口"被请求关闭"必须留下**证据**。
+    /// ★ 2026-10-21：窗口"被请求关闭"必须留下**证据**。
+    ///
     /// 背景：应用曾经"每 ~10 秒静默退出一次"（journal 里只有 systemd 的
     /// `Consumed ... over 10.186s wall clock time`，没有 panic、没有 error、退出码 0）。
     /// 代码里没有任何 `std::process::exit`，说明当时唯一的出口是 **iced 事件循环正常返回**
-    /// 也就是"最后一个窗口被关掉了"。到底是谁要关它（合成器发 `xdg_toplevel.close`、
+    /// —— 也就是"最后一个窗口被关掉了"。到底是谁要关它（合成器发 `xdg_toplevel.close`、
     /// 还是用户点 X）以前完全看不见；这里把它打成一行日志，
     /// 配合 main.rs 里 "[exit] cosmic::app::run 返回 ..." 一起看，静默退出就再也藏不住。
+    ///
     /// 返回 `None` = 照旧允许关闭（不改变用户点 X 的行为）。
     fn on_close_requested(&self, id: cosmic::iced::window::Id) -> Option<Self::Message> {
         eprintln!("[close] 窗口 {id:?} 收到关闭请求（若这条日志出现在'自己退出'之前，就是它导致的）");
@@ -563,7 +640,7 @@ impl cosmic::Application for AppModel {
             .data::<Page>(Page::Workshop)
             .icon(icon::from_name("folder-download-symbolic"));
 
-        // page <名字> 直接切到指定页。位置：0 已安装 / 1 发现 / 2 设置 / 3 创意工坊
+        // --page <名字> 直接切到指定页。位置：0 已安装 / 1 发现 / 2 设置 / 3 创意工坊
         let args: Vec<&str> = flags.split_whitespace().collect();
         let page = args
             .iter()
@@ -580,10 +657,10 @@ impl cosmic::Application for AppModel {
         };
         nav.activate_position(position);
         let pending_native_apply_first = args.contains(&"--native-apply-first");
-        // select-first / --expand-first：启动就选中第一条（截图验证右侧详情面板用；
+        // --select-first / --expand-first：启动就选中第一条（截图验证右侧详情面板用；
         // 本机没有输入模拟工具，走的是和点缩略图完全相同的代码路径）
         let select_first = args.contains(&"--select-first") || args.contains(&"--expand-first");
-        // select-id <工坊id>：启动就选中指定的那一条（截图验证某个具体壁纸的属性面板用）
+        // --select-id <工坊id>：启动就选中指定的那一条（截图验证某个具体壁纸的属性面板用）
         let select_id = args
             .iter()
             .position(|a| *a == "--select-id")
@@ -591,9 +668,11 @@ impl cosmic::Application for AppModel {
             .map(|s| s.to_string());
 
         // 验收专用（本机 Wayland 下没有输入模拟工具）：
-        // card-size 小|中|大|0..2 卡片档（走和「尺寸」滑杆**完全相同**的 Message）
-        // time-scale <0.25..3> 单次设播放速度（走 TimeScaleSet）
-        // volume <0..100> 单次设场景音频音量（走 MusicVolumeSet）
+        //   --card-size 小|中|大|0..2     卡片档（走和「尺寸」滑杆**完全相同**的 Message）
+        //   --time-scale <0.25..3>        单次设播放速度（走 TimeScaleSet）
+        //   --volume <0..100>             单次设场景音频音量（走 MusicVolumeSet）
+        //   --drag-time-scale from:to[:steps] / --drag-volume from:to[:steps]
+        //        按 10 ms 一拍连续喂同一个 Message（= 拖动），用来量**端到端**节流
         let arg_of = |name: &str| -> Option<String> {
             args.iter()
                 .position(|a| *a == name)
@@ -608,21 +687,36 @@ impl cosmic::Application for AppModel {
         });
         let time_scale_arg = arg_of("--time-scale").and_then(|v| v.trim().parse::<f32>().ok());
         let volume_arg = arg_of("--volume").and_then(|v| v.trim().parse::<f32>().ok());
-        // open-color <属性键>：启动就把这条属性**展开成圆形色盘**（只给截图用；
+        let drag_arg = |name: &str, knob: u8| -> Option<Drag> {
+            let v = arg_of(name)?;
+            let mut it = v.split(':');
+            let from: f32 = it.next()?.trim().parse().ok()?;
+            let to: f32 = it.next()?.trim().parse().ok()?;
+            let steps: u32 = it.next().and_then(|s| s.trim().parse().ok()).unwrap_or(120);
+            Some(Drag {
+                knob,
+                from,
+                to,
+                steps: steps.max(2),
+                i: 0,
+            })
+        };
+        let drag = drag_arg("--drag-time-scale", 0).or_else(|| drag_arg("--drag-volume", 1));
+        // --open-color <属性键>：启动就把这条属性**展开成圆形色盘**（只给截图用；
         // 走的是和点一下色点完全相同的 `open_color` 状态，没有第二套逻辑）
         let open_color = args
             .iter()
             .position(|a| *a == "--open-color")
             .and_then(|i| args.get(i + 1))
             .map(|s| s.to_string());
-        // perf-preset <名字>：脚本化验证用 —— 走**和设置页按钮同一条** update 路径
+        // --perf-preset <名字>：脚本化验证用 —— 走**和设置页按钮同一条** update 路径
         // （另写一份下发逻辑就证明不了界面那条路通）
         let perf_preset = args
             .iter()
             .position(|a| *a == "--perf-preset")
             .and_then(|i| args.get(i + 1))
             .map(|s| s.to_string());
-        // perf-msg <名字>：脚本化验证「高级四项」用的 —— 每个名字 = 按一下某个按钮的那条 Message
+        // --perf-msg <名字>：脚本化验证「高级四项」用的 —— 每个名字 = 按一下某个按钮的那条 Message
         // （同一个 handler；可用 fps-5 / fps+5 / scale / effects / sleep / push / fit-cover|fit-stretch|fit-center|fit-contain，可重复，按顺序应用）
         let perf_msgs: Vec<String> = args
             .iter()
@@ -632,7 +726,7 @@ impl cosmic::Application for AppModel {
             .map(|s| s.to_string())
             .collect();
 
-        // toggle-prop <key>：脚本化验证「UI 改属性 → 内核 → 屏幕」闭环用（本机没有 wtype/ydotool，
+        // --toggle-prop <key>：脚本化验证「UI 改属性 → 内核 → 屏幕」闭环用（本机没有 wtype/ydotool，
         // 无法真的点勾选框）。对**第一条**壁纸把该 bool 属性置为 true，走 `Message::PropBool` ——
         // 与手点勾选框**完全相同**的那条分支。
         let toggle_props: Vec<String> = args
@@ -643,14 +737,14 @@ impl cosmic::Application for AppModel {
             .map(|s| s.to_string())
             .collect();
 
-        // apply-id <工坊id>：启动就把**指定这一条**下发给内核（走与详情面板 [应用] 按钮
+        // --apply-id <工坊id>：启动就把**指定这一条**下发给内核（走与详情面板 [应用] 按钮
         // **完全相同**的 `Message::Apply`）。用来验证「切壁纸时该条的分槽色彩跟着下来」。
         let apply_id = args
             .iter()
             .position(|a| *a == "--apply-id")
             .and_then(|i| args.get(i + 1))
             .map(|s| s.to_string());
-        // color-set <项>:<值>：把**当前选中**那条壁纸的画面色彩第 <项> 项直接设成 <值>
+        // --color-set <项>:<值>：把**当前选中**那条壁纸的画面色彩第 <项> 项直接设成 <值>
         // （走与属性面板滑块完全相同的 `Message::ColorSet`）。可重复、按顺序应用。
         // 项：0 亮度 / 1 对比 / 2 饱和 / 3 色相(弧度) / 4 色温 / 5 伽马。
         let color_sets: Vec<(usize, f32)> = args
@@ -664,7 +758,7 @@ impl cosmic::Application for AppModel {
             })
             .collect();
 
-        // preset-save / --preset-load / --props-apply-all / --props-share / --props-reset：
+        // --preset-save / --preset-load / --props-apply-all / --props-share / --props-reset：
         // 「您的预设」那一排按钮的脚本化入口（本机没有 wtype/ydotool ⇒ 点不了按钮）。
         // 每条都走**和点按钮完全相同**的那条 Message 分支。
         let preset_flags: Vec<Message> = [
@@ -678,7 +772,7 @@ impl cosmic::Application for AppModel {
         .filter(|(flag, _)| args.contains(flag))
         .map(|(_, msg)| msg)
         .collect();
-        // props-json：只把「分享 JSON」那份文本打到日志（不碰剪贴板、不改任何状态）
+        // --props-json：只把「分享 JSON」那份文本打到日志（不碰剪贴板、不改任何状态）
         let want_props_json = args.contains(&"--props-json");
 
         let about = About::default()
@@ -706,7 +800,13 @@ impl cosmic::Application for AppModel {
             }
         };
 
-        // 帧率**不再是全局的**。旧配置里那个全局 `fps` 键（曾经被拿来每次应用
+        // 工坊页筛选的初始状态：从持久配置读（`workshop_filter_state` / `workshop_filter_open`）。
+        // 读出来先拷贝成局部量 —— 下面的结构体字面量里 `config` 会被 move 进去。
+        // `--workshop-filter-open` 只给截图用：强制展开筛选区（不然截不到那一块）。
+        let filter_lines = config.workshop_filter_state.clone();
+        let filter_open = config.workshop_filter_open || args.contains(&"--workshop-filter-open");
+
+        // 2026-10-14：帧率**不再是全局的**。旧配置里那个全局 `fps` 键（曾经被拿来每次应用
         // 都下发、把场景自己的帧率盖成 30）现在既不被读取也不再写入 ⇒ 这里如实说一句。
         match legacy_global_fps(Self::APP_ID) {
             Some(old) => eprintln!(
@@ -727,10 +827,10 @@ impl cosmic::Application for AppModel {
         }
 
         let start_native = config.backend_native;
-        // 连上内核时"自动推进上次应用"的总开关。
-        // 默认取持久配置（`Config::auto_apply_last`，默认 true = "内核空闲时补一条"）；
-        // `--no-auto-apply` / `WPHUB_NO_AUTO_APPLY=1` 本次会话强制关（一个字也不推）。
-        // 注意：**无论开关如何，内核正在播的那条永远不会被换掉**（见 `decide_auto_apply`）。
+        // ★ 2026-10-15：连上内核时"自动推进上次应用"的总开关。
+        //   默认取持久配置（`Config::auto_apply_last`，默认 true = "内核空闲时补一条"）；
+        //   `--no-auto-apply` / `WPHUB_NO_AUTO_APPLY=1` 本次会话强制关（一个字也不推）。
+        //   注意：**无论开关如何，内核正在播的那条永远不会被换掉**（见 `decide_auto_apply`）。
         let no_auto_apply = args.contains(&"--no-auto-apply")
             || matches!(
                 std::env::var("WPHUB_NO_AUTO_APPLY").ok().as_deref(),
@@ -806,12 +906,33 @@ impl cosmic::Application for AppModel {
             discover_error: None,
             discover_page: 1,
             discover_sort: 0,
+            // 筛选默认来自持久配置（用户要求"重启/切页后筛选状态保留"）：
+            // 空表 = **WE 默认筛选**（排除 Application、只留大众级、分辨率全勾）；
+            // 读出来先过一遍受控词表（`from_lines` 会丢掉不认识的组/标签），
+            // 所以配置里残留的旧标签不会变成"发了却永远筛不到东西"的请求。
+            discover_filter: workshop::Filter::from_lines(&filter_lines),
+            discover_filter_open: filter_open,
+            // 每组的折叠态只活本次会话（空表 = 用 `Group::collapsed` 的默认）
+            filter_collapsed: BTreeMap::new(),
+            filter_debounce: FilterDebounce::new(),
+            filter_searches: 0,
+            filter_fetch_mark: 0,
+            discover_total: None,
+            discover_queries: 0,
             // 卡片尺寸 / 播放速度 / 场景音频音量（速度 1.0 = 官方口径；
             // 音量默认 100% —— **不读**系统音量：那是别的东西，读进来就跟着 PC 的音量条跑了）
             card_idx: card_size_arg.unwrap_or(CARD_DEFAULT),
+            drag_start: drag.as_ref().map(|_| {
+                let ms = std::env::var("WPHUB_DRAG_DELAY_MS")
+                    .ok()
+                    .and_then(|v| v.trim().parse::<u64>().ok())
+                    .unwrap_or(0);
+                std::time::Instant::now() + Duration::from_millis(ms)
+            }),
+            drag,
             time_scale: 1.0,
             music_vol: Some(SCENE_VOLUME_DEFAULT),
-            // workshop-select <工坊id>：发现页结果一到就选中这条（截图用，等价于点缩略图）
+            // --workshop-select <工坊id>：发现页结果一到就选中这条（截图用，等价于点缩略图）
             pending_workshop_select: args
                 .iter()
                 .position(|a| *a == "--workshop-select")
@@ -829,7 +950,7 @@ impl cosmic::Application for AppModel {
             show_panel: true,
             panel_bottom: args.contains(&"--panel-bottom"),
             settings_bottom: args.contains(&"--settings-bottom"),
-            // panel-scroll <像素>：截图时把面板滚到想看的那一段
+            // --panel-scroll <像素>：截图时把面板滚到想看的那一段
             panel_scroll_req: args
                 .iter()
                 .position(|a| *a == "--panel-scroll")
@@ -851,7 +972,7 @@ impl cosmic::Application for AppModel {
 
         // 「宣传图」**默认开**（见 `Config::show_promo`：用户要"放回来/默认展示"）。
         // 本次会话想临时改：
-        // promo / --no-promo（启动参数） 或 WPHUB_PROMO=1 / =0（环境变量，供脚本用）
+        //   --promo / --no-promo（启动参数）  或  WPHUB_PROMO=1 / =0（环境变量，供脚本用）
         // 只改本次会话的内存值；要长期生效用设置页那个开关（它会持久化）。
         if args.contains(&"--promo") {
             app.config.show_promo = true;
@@ -872,7 +993,7 @@ impl cosmic::Application for AppModel {
             "[promo] 本次会话宣传图显示 = {}（默认开；--promo/--no-promo、WPHUB_PROMO 或设置页可关）",
             if app.config.show_promo { "开" } else { "关" }
         );
-        // workshop-query <关键词>：**只给截图用** —— 启动那一次工坊搜索用这个关键词
+        // --workshop-query <关键词>：**只给截图用** —— 启动那一次工坊搜索用这个关键词
         // （`Message::DiscoverRunSearch` 走的是和点 [搜索] 完全相同的分支）。
         // 为什么需要它：本机没有输入模拟工具，点不了/打不了搜索框（同 `--workshop-select` 的理由）。
         match args
@@ -886,6 +1007,51 @@ impl cosmic::Application for AppModel {
             }
             None => {}
         }
+        // ── 验收脚本：筛选项注入（**没有输入模拟工具**，所以靠启动参数点标签）──────
+        // 每一条都走 `app.update(Message::DiscoverFilterToggleTag(..))`，和鼠标点 chip 是
+        // **完全同一条**分支 ⇒ 防抖/网络计数/持久化全都照走，不是"另开一条捷径"。
+        //   --workshop-filter "genre:Anime,kind:Scene"   按顺序点这些标签（一组一个 → AND）
+        //   --workshop-filter "genre:Anime,genre:Game"   同组两个 → 组内 OR（2 个组合）
+        //   --workshop-filter-burst "genre:Anime"        连点同一个标签（默认 5 次）验防抖
+        //   --workshop-filter-burst-count N              改连点次数
+        let mut filter_clicks: Vec<(String, String)> = Vec::new();
+        // 启动参数是按空白切词的（`flags.split_whitespace()`）⇒ 带空格的标签
+        // （`3840 x 2160`）在命令行里要写 `3840_x_2160`：这里把 `_` 还原成空格。
+        let unspace = |t: &str| t.trim().replace('_', " ");
+        if let Some(spec) = args
+            .iter()
+            .position(|a| *a == "--workshop-filter")
+            .and_then(|i| args.get(i + 1))
+        {
+            for item in spec.split(',').filter(|s| !s.trim().is_empty()) {
+                match item.split_once(':') {
+                    Some((k, t)) => filter_clicks.push((k.trim().to_string(), unspace(t))),
+                    None => eprintln!("[--workshop-filter] 看不懂这一段（要 组:标签）：{item:?}"),
+                }
+            }
+        }
+        if let Some(spec) = args
+            .iter()
+            .position(|a| *a == "--workshop-filter-burst")
+            .and_then(|i| args.get(i + 1))
+        {
+            let n = args
+                .iter()
+                .position(|a| *a == "--workshop-filter-burst-count")
+                .and_then(|j| args.get(j + 1))
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(5);
+            match spec.split_once(':') {
+                Some((k, t)) => {
+                    for _ in 0..n {
+                        filter_clicks.push((k.trim().to_string(), unspace(t)));
+                    }
+                    eprintln!("[--workshop-filter-burst] 连点 {n} 次 {k}:{t}（只为证明防抖）");
+                }
+                None => eprintln!("[--workshop-filter-burst] 要 组:标签，收到 {spec:?}"),
+            }
+        }
+
         // 应用内主题：**跟随系统**（COSMIC 上原生；其它桌面退化为中性，见 `we_ui::theme`）。
         // 只作用于本程序，不写系统配置、不改系统主题。
         let mut command = Task::batch(vec![
@@ -893,13 +1059,28 @@ impl cosmic::Application for AppModel {
             Task::done(cosmic::app::Action::AppThemeChange(we_ui::theme()))
                 .map(cosmic::Action::Cosmic),
         ]);
-        if position == 1 || position == 3 {
+        let injected = filter_clicks.len();
+        if injected > 0 {
+            eprintln!(
+                "[--workshop-filter] 注入 {injected} 次标签点击（窗口 {}ms 内只应放行 1 次）",
+                config::WS_FILTER_DEBOUNCE_MS
+            );
+            let mut tasks = vec![command];
+            for (key, tag) in filter_clicks {
+                tasks.push(app.update(Message::DiscoverFilterToggleTag(key, tag)));
+            }
+            command = Task::batch(tasks);
+        }
+        if (position == 1 || position == 3) && injected == 0 {
             let search = app.update(Message::DiscoverRunSearch);
             command = Task::batch(vec![command, search]);
+        } else if (position == 1 || position == 3) && injected > 0 {
+            eprintln!("[--workshop-filter] 起动就带筛选：那一次搜索交给 300ms 防抖放行，不额外搜一次");
         }
-        // perf-preset <名字>：走和设置页按钮完全相同的那条 update 分支
+
+        // --perf-preset <名字>：走和设置页按钮完全相同的那条 update 分支
         // （真正的下发要等内核连上：request_async 会失败并留下 perf_synced=false，
-        // 第一次 NativeStatus 时自动补发 —— 这就是"内核无状态、界面负责同步"那条路）
+        //   第一次 NativeStatus 时自动补发 —— 这就是"内核无状态、界面负责同步"那条路）
         if let Some(name) = perf_preset {
             let preset = app.update(Message::PerfPreset(name));
             command = Task::batch(vec![command, preset]);
@@ -917,7 +1098,7 @@ impl cosmic::Application for AppModel {
             let task = app.update(Message::SetCardSize(i));
             command = Task::batch(vec![command, task]);
         }
-        // perf-msg 的每一条都走和对应按钮完全相同的 update 分支
+        // --perf-msg 的每一条都走和对应按钮完全相同的 update 分支
         for name in perf_msgs {
             match perf_msg_from_name(&name) {
                 Some(msg) => {
@@ -934,10 +1115,10 @@ impl cosmic::Application for AppModel {
         app.sync_library_roots();
         app.adopt_wallpapers(local::scan_with(&app.config.library_dirs));
         // 启动参数：选中第一条 / 指定的那一条（截图/验证右侧详情面板）
-        // 放在 --toggle-prop / --preset-* 之前：那两组参数都作用于「当前选中的那条」。
-        // 走 `Message::Select` 这条**和点缩略图完全相同**的路（而不是直接调 select）：
-        // 选中会顺手起「宣传图」的后台下载流，那条流是在 update 的末尾统一发出去的，
-        // 绕过 update 就没人把它交出去（*首次实测踩过*）。
+        // ★ 放在 --toggle-prop / --preset-* 之前：那两组参数都作用于「当前选中的那条」。
+        // ★ 走 `Message::Select` 这条**和点缩略图完全相同**的路（而不是直接调 select()）：
+        //   选中会顺手起「宣传图」的后台下载流，那条流是在 update 的末尾统一发出去的，
+        //   绕过 update 就没人把它交出去（*首次实测踩过*）。
         if let Some(id) = select_id {
             if app.wallpapers.iter().any(|w| w.id == id) {
                 let sel = app.update(Message::Select(id));
@@ -952,9 +1133,9 @@ impl cosmic::Application for AppModel {
             command = Task::batch(vec![command, sel]);
         }
 
-        // apply-id <id>：**不在这里下发**（此刻 socket 还没就绪）—— 记在 `pending_apply_id`，
+        // --apply-id <id>：**不在这里下发**（此刻 socket 还没就绪）—— 记在 `pending_apply_id`，
         // 第一次连上内核时补跑一遍 `apply_native`（和 `--toggle-prop` 的补跑同一个套路）。
-        // color-set <项>:<值>：对**当前选中**那条壁纸设色彩（= 拖一下属性面板里的滑块）。
+        // --color-set <项>:<值>：对**当前选中**那条壁纸设色彩（= 拖一下属性面板里的滑块）。
         // 此刻内核还没连上 ⇒ `set_color` 只落盘（这正是分槽的意义：先记住，切过去时下发）；
         // 连上之后由 `NativeStatus` 的同步那一段把这条壁纸的色彩补发出去。
         for (i, v) in color_sets {
@@ -962,7 +1143,7 @@ impl cosmic::Application for AppModel {
             command = Task::batch(vec![command, t]);
         }
 
-        // toggle-prop：对**当前选中**（没有就第一条）壁纸把该 bool 属性置为 true（与点勾选框同一条分支）
+        // --toggle-prop：对**当前选中**（没有就第一条）壁纸把该 bool 属性置为 true（与点勾选框同一条分支）
         for key in toggle_props {
             let id = app
                 .selected
@@ -974,14 +1155,14 @@ impl cosmic::Application for AppModel {
             }
         }
 
-        // preset-save / --preset-load / --props-apply-all / --props-share / --props-reset：
+        // --preset-save / --preset-load / --props-apply-all / --props-share / --props-reset：
         // 脚本化验证「您的预设」那一排按钮 —— 每个都走**和点按钮完全相同**的那条 Message 分支。
         for msg in preset_flags {
             let task = app.update(msg);
             command = Task::batch(vec![command, task]);
         }
 
-        // props-json：把「分享 JSON」那**同一份**文本打到日志（同一个生成函数，不是另写一份）
+        // --props-json：把「分享 JSON」那**同一份**文本打到日志（同一个生成函数，不是另写一份）
         if want_props_json
             && let Some(id) = app.selected.clone()
         {
@@ -1077,7 +1258,7 @@ impl cosmic::Application for AppModel {
             .push(top)
             .push(we_ui::divider())
             .push(body);
-        // 底部只有状态条了：原来那行「播放列表」（读取/保存/配置/+添加壁纸 + 条数摘要）已去掉
+        // 底部只有状态条了：原来那行「播放列表」（读取/保存/配置/+添加壁纸 + 条数摘要）已按用户要求去掉
         // （本程序不做壁纸、也没有播放列表这个功能；详情面板的 [应用]/[确认] 仍在下发链路里）。
         col = col.push(self.view_status_bar());
         // 窗口底：**不刷不透明色**，交给 libcosmic 那层「主题半透明背景」
@@ -1108,6 +1289,14 @@ impl cosmic::Application for AppModel {
             // 窗口尺寸：方块缩略图按它自动决定每行放几个
             cosmic::iced::window::resize_events().map(|(_id, size)| Message::WindowResized(size.width)),
         ];
+        // 脚本化拖动（验收）：10 ms 一拍 ⇒ 100 Hz 喂值，和真拖动同一个频率量级。
+        // 等连上内核再开始（否则前几拍会落在"后台没起来"上，白丢值）。
+        if self.drag.is_some() && self.native.is_some() {
+            subs.push(
+                cosmic::iced::time::every(Duration::from_millis(10))
+                    .map(|_| Message::DragTick),
+            );
+        }
         // 诊断（`WPHUB_WIN_EVENTS=1`）：把每一个窗口事件打出来 —— 事件循环"正常返回"的
         // 唯一常见原因就是**窗口被关掉**，这里能看见是 CloseRequested 还是别的。
         if std::env::var("WPHUB_WIN_EVENTS").ok().as_deref() == Some("1") {
@@ -1198,7 +1387,7 @@ impl cosmic::Application for AppModel {
                 }
                 // 内核连上了、当前正停在设置页、这次还没要到 sink 列表 ⇒ 在后台补要一次。
                 // （只补一次：拿到回执后 `audio_sinks_asked` 就是 true；内核报"无法枚举"也**不重试**，
-                // 用户点「重新枚举」或重新进设置页才会再来。）
+                //   用户点「重新枚举」或重新进设置页才会再来。）
                 if self.native.is_some()
                     && !self.audio_sinks_asked
                     && self.nav.active_data::<Page>().copied() == Some(Page::Settings)
@@ -1270,11 +1459,11 @@ impl cosmic::Application for AppModel {
                         if let Some(v) = self.music_vol {
                             native::request_async(native::cmd_set_volume(v));
                         }
-                        // 内核里**已经在播**的壁纸是权威 —— 启动同步**绝不**把它换掉。
-                        // 这是真实困扰的修法：为装/装修复而重启内核时，桌面壁纸不该被 app
-                        // "上次应用"那条换走（实测 X-Ray 2564205376 被换成 1931934283）。
-                        // 只有内核**空闲**（没内容 / 没在播）时才允许推进"上次应用"；
-                        // `--no-auto-apply` / 配置关掉则**一个字也不推**。判据是纯函数 `decide_auto_apply`。
+                        // ★ 2026-10-15：内核里**已经在播**的壁纸是权威 —— 启动同步**绝不**把它换掉。
+                        //   这是真实困扰的修法：为装/装修复而重启内核时，桌面壁纸不该被 app
+                        //   "上次应用"那条换走（实测 X-Ray 2564205376 被换成 1931934283）。
+                        //   只有内核**空闲**（没内容 / 没在播）时才允许推进"上次应用"；
+                        //   `--no-auto-apply` / 配置关掉则**一个字也不推**。判据是纯函数 `decide_auto_apply`。
                         let kernel_busy = kernel_has_content(self.native.as_ref());
                         let has_last = self.native_last.is_some();
                         match decide_auto_apply(self.auto_apply_enabled, kernel_busy, has_last) {
@@ -1283,7 +1472,7 @@ impl cosmic::Application for AppModel {
                                     let id = self
                                         .wallpaper_id_for_path(&path)
                                         .unwrap_or_else(|| "(不在列表里)".into());
-                                    // 要求：每次自动应用都要留一行（场景 id + 触发原因）
+                                    // ★ 要求：每次自动应用都要留一行（场景 id + 触发原因）
                                     eprintln!(
                                         "[控制面] 自动应用「上次应用」{id} · 原因=连上内核且内核空闲（没在播）· kind={kind} path={path}"
                                     );
@@ -1307,12 +1496,12 @@ impl cosmic::Application for AppModel {
                             // 内核空闲、也没有"上次应用" ⇒ 无事可做（不打日志，免得每次连上都刷屏）
                             AutoApply::NothingRemembered => {}
                         }
-                        // **分槽画面色彩**也走这条"连上就重发"的路。内核无状态
-                        // （重启后色彩是中性），而界面按壁纸 id 存着各自的色彩（`color_by_id`）
-                        // ⇒ 把**这次要播的那张**的色彩补发一次：**优先用内核当前在播的那张**
-                        // （内核是权威 —— 与上面"不换掉在播的那条"同一条事实），
-                        // 内核没在播时才退回 `native_last`（启动参数刚下发的那条）；
-                        // 都没有才用旧的全局值。此后切壁纸/拖滑块仍走即时下发（见 `set_color`）。
+                        // ★ 2026-10-12：**分槽画面色彩**也走这条"连上就重发"的路。内核无状态
+                        //   （重启后色彩是中性），而界面按壁纸 id 存着各自的色彩（`color_by_id`）
+                        //   ⇒ 把**这次要播的那张**的色彩补发一次：**优先用内核当前在播的那张**
+                        //   （内核是权威 —— 与上面"不换掉在播的那条"同一条事实），
+                        //   内核没在播时才退回 `native_last`（启动参数刚下发的那条）；
+                        //   都没有才用旧的全局值。此后切壁纸/拖滑块仍走即时下发（见 `set_color`）。
                         let color_id = self
                             .playing_id()
                             .or_else(|| {
@@ -1326,10 +1515,10 @@ impl cosmic::Application for AppModel {
                         };
                         let who = color_id.clone().unwrap_or_else(|| "(全局)".into());
                         self.push_color(&col, &format!("启动同步（这条壁纸 {who} 的色彩）"));
-                        // **属性覆盖表**同理 —— 内核重启后覆盖表是空的，而界面存了一份
-                        // （`prop_overrides.json`）⇒ 把"正在播放那张"的整套属性重发一次
-                        // （`clear=true`：先清空再写，避免上一张的属性残留）。这样"界面显示的状态"
-                        // 与"屏幕上实际的状态"始终一致；此后每次改动仍走即时下发（见 `set_prop`）。
+                        // ★ 2026-10-12：**属性覆盖表**同理 —— 内核重启后覆盖表是空的，而界面存了一份
+                        //   （`prop_overrides.json`）⇒ 把"正在播放那张"的整套属性重发一次
+                        //   （`clear=true`：先清空再写，避免上一张的属性残留）。这样"界面显示的状态"
+                        //   与"屏幕上实际的状态"始终一致；此后每次改动仍走即时下发（见 `set_prop`）。
                         let playing_path = self
                             .native
                             .as_ref()
@@ -1369,7 +1558,7 @@ impl cosmic::Application for AppModel {
                     self.kernel_perf = native::perf_from_reply(&reply);
                 }
                 // 音频那两条：① 列可用输出（存进模型，供设置页画选择器）
-                // ② 切输出源（提示跟上了哪一路；失败把内核的理由原样带出来）
+                //             ② 切输出源（提示跟上了哪一路；失败把内核的理由原样带出来）
                 if cmd == "audio" {
                     let asked_sink = native::raw_value(&request, "sink").unwrap_or_default();
                     if native::get_bool(&request, "sinks") {
@@ -1418,7 +1607,7 @@ impl cosmic::Application for AppModel {
                 }
                 // 用户动作的回执 ⇒ 立刻刷一次状态，不等下一个 3 秒 tick。
                 // ⚠ **只有非 status 的回执才允许再发 status**：status 的请求也会走
-                // `rx.recv → Message::NativeReply` 这条路回来；若不判断，回执又会再发一次
+                // `rx.recv() → Message::NativeReply` 这条路回来；若不判断，回执又会再发一次
                 // status ⇒ `status → reply → status → …` **自我循环**，以 socket 往返速度空转
                 // （实测空闲 ~8k 请求/秒、主线程约 100% CPU，纯浪费、状态还一份没多刷）。
                 // 周期性刷新由 subscription 里那条 3 秒 ticker（`Message::NativeStatus`）负责。
@@ -1643,18 +1832,25 @@ impl cosmic::Application for AppModel {
                 self.discover_loading = true;
                 self.discover_error = None;
                 self.discover_t0 = Some(std::time::Instant::now());
+                self.filter_searches += 1;
+                // 记下"这次搜索开始前的网络计数" ⇒ 结果回来时相减 = 这次真的打了几次 browse
+                // （缓存命中不算；连点验收就看这个数）。所有搜索入口都经过这里，所以放在这。
+                self.filter_fetch_mark = workshop::browse_fetch_count();
                 // 重置"UI 最坏一帧"统计（下面 ThumbsDone 时打印）
                 let _ = upd_max_us_take();
                 let query = self.discover_query.clone();
                 let page = self.discover_page;
                 let sort = workshop::SORTS[self.discover_sort % workshop::SORTS.len()].0;
+                // 筛选是**多选**的：搜索线程里要按组合各发一次 browse（组内 OR、组间 AND），
+                // 所以把 Filter 整个搬进阻塞任务（它是 Clone 的纯数据）。
+                let filter = self.discover_filter.clone();
                 return Task::perform(
                     async move {
                         // HTTP 是阻塞式，放到线程池，别卡住 UI
                         tokio::task::spawn_blocking(move || {
                             // 阶段一：**只要条目**（缓存命中时几十毫秒就回来），
                             // 缩略图随后由 DiscoverResult 里的 Task::stream 后台逐张补
-                            workshop::search_entries(&query, page, sort)
+                            workshop::search_entries(&query, page, sort, &filter)
                         })
                         .await
                         .unwrap_or_else(|e| Err(format!("搜索任务失败: {e}")))
@@ -1669,17 +1865,34 @@ impl cosmic::Application for AppModel {
                 match *result {
                     Ok(found) => {
                         // 阶段一的结果：条目**先上屏**（还没有图 ⇒ 界面给"无预览"占位）。
-                        // 这是一次性 search 的关键改动：以前要等 items+thumbs 全好才显示。
+                        // 这是一次性 search() 的关键改动：以前要等 items+thumbs 全好才显示。
+                        //
                         // ⚠ **上屏前的最后一道按 id 去重**（`workshop::dedupe_by_id`）：
-                        // 数据层（`search_entries`）已经折过一次，这里再折一次是因为**列表的
-                        // 组装点**才是不许重复的那一处 —— 以后如果本地已下载条目、缓存条目、
-                        // 第二页结果并进这个列表，重复 id 只可能出现在这里。
-                        // 判据只有 id 相等（不按标题：标题极像的两条是**不同**条目）
-                        // `dedupe_never_merges_different_ids_even_with_identical_titles`）。
-                        // 去重是"整条丢/整条留"，留下那条的 id 不变 ⇒ 右上角"已订阅"角标
-                        // （按 id 查本机订阅集合）不会因为去重而丢。
+                        //   数据层（`search_entries`）已经折过一次，这里再折一次是因为**列表的
+                        //   组装点**才是不许重复的那一处 —— 以后如果本地已下载条目、缓存条目、
+                        //   第二页结果并进这个列表，重复 id 只可能出现在这里。
+                        //   判据只有 id 相等（不按标题：标题极像的两条是**不同**条目，见
+                        //   `dedupe_never_merges_different_ids_even_with_identical_titles`）。
+                        //   去重是"整条丢/整条留"，留下那条的 id 不变 ⇒ 右上角"已订阅"角标
+                        //   （按 id 查本机订阅集合）不会因为去重而丢。
                         let (items, dup_ids) = workshop::dedupe_by_id(found.items);
                         self.discover_links = found.stats.link_occurrences;
+                        // 筛选的证据：Steam 报的总条数（一页只发一条查询 ⇒ queries 恒为 1）
+                        self.discover_total = found.stats.total_count;
+                        self.discover_queries = found.stats.queries;
+                        // 防抖验收：这一次搜索**真实**打了几次 browse（缓存命中不算）。
+                        // 连点 5 次筛选时这里应该只有 1（拿掉筛选、或详情/缩略图重试才会更多）。
+                        let fetched = workshop::browse_fetch_count().saturating_sub(self.filter_fetch_mark);
+                        eprintln!(
+                            "[filter] 本次搜索 browse 网络请求 {fetched} 次（组合 {} · 搜索第 {} 次 · 防抖放行累计 {} 次 · 总条数 {}）\
+                             —— 请求数含重试；「搜索第 N 次」才是防抖放行后的搜索次数",
+                            self.discover_queries,
+                            self.filter_searches,
+                            self.filter_debounce.releases,
+                            self.discover_total
+                                .map(|t| t.to_string())
+                                .unwrap_or_else(|| "?".into())
+                        );
                         self.discover_dedup = dup_ids.len();
                         if !dup_ids.is_empty() {
                             eprintln!(
@@ -1707,7 +1920,7 @@ impl cosmic::Application for AppModel {
                         self.discover_thumbs.clear();
                         self.discover_thumb_raw.clear();
                         self.discover_thumb_stats = None;
-                        // workshop-select：结果一到就选中那条（= 点缩略图，同一条 Message）。
+                        // --workshop-select：结果一到就选中那条（= 点缩略图，同一条 Message）。
                         // ⚠ **不能在这里直接 return** —— 下面那段还要起缩略图流，两个 Task 要一起发。
                         let select_task = match self.pending_workshop_select.clone() {
                             Some(id) if self.discover_items.iter().any(|i| i.id == id) => {
@@ -1798,9 +2011,114 @@ impl cosmic::Application for AppModel {
                 return self.update(Message::DiscoverRunSearch);
             }
 
+            // ── 工坊页·筛选（与 WE 面板同构：勾选 = 不排除）────────────────────
+            //
+            // 连点 5 次 ≠ 5 次请求：勾选只改**本地状态**并把代数 +1，然后排一条
+            // 300ms 后的定时消息；定时消息到点时只有"代数还是我这一代"才真的去搜。
+            // 于是连点 5 次只有一个定时器活下来 ⇒ 一次 release ⇒ 一次 browse。
+            Message::DiscoverFilterToggle => {
+                self.discover_filter_open = !self.discover_filter_open;
+                self.persist_filter();
+            }
+
+            Message::DiscoverFilterCollapse(key) => {
+                let group = workshop::GROUPS.iter().find(|g| g.key == key);
+                let default_collapsed = group.is_some_and(|g| g.collapsed);
+                let open = self.filter_group_open(&key, default_collapsed);
+                self.filter_collapsed.insert(key, !open);
+            }
+
+            Message::DiscoverFilterToggleTag(key, tag) => {
+                // 只认真标签：组键/标签不在 `workshop::GROUPS` 里就什么都不改
+                // （点了没反应，但绝不会发一个 Steam 不认的标签出去）
+                if !workshop::is_real_tag(&key, &tag) {
+                    eprintln!("[filter] {key}:{tag} 不在词表里 ⇒ 忽略（状态不变、不发请求）");
+                    return Task::none();
+                }
+                // 勾选 = **不排除**（WE 的黑名单取反）：去勾才是"排除这一项"
+                let now_on = self.discover_filter.toggle(&key, &tag);
+                eprintln!(
+                    "[filter] 点 {key}:{tag} → {}（改动 {} 项 · {}）",
+                    if now_on {
+                        "勾上（不排除）"
+                    } else {
+                        "去勾（排除）"
+                    },
+                    self.discover_filter.changed_count(),
+                    self.discover_filter.describe()
+                );
+                return self.arm_filter_debounce();
+            }
+
+            Message::DiscoverFilterToggleOnly(key) => {
+                if !workshop::SHOW_ONLY.iter().any(|o| o.key == key) {
+                    eprintln!("[filter] 仅显示里没有 {key} ⇒ 忽略");
+                    return Task::none();
+                }
+                let now_on = self.discover_filter.toggle_only(&key);
+                eprintln!(
+                    "[filter] 仅显示 {key} → {}（{}）",
+                    if now_on { "勾上" } else { "去勾" },
+                    self.discover_filter.describe()
+                );
+                return self.arm_filter_debounce();
+            }
+
+            Message::DiscoverFilterAllNone(group, section, all) => {
+                self.discover_filter.set_section(&group, &section, all);
+                eprintln!(
+                    "[filter] {group}/{section} → {}（{}）",
+                    if all { "所有" } else { "无" },
+                    self.discover_filter.describe()
+                );
+                return self.arm_filter_debounce();
+            }
+
+            Message::DiscoverFilterReset => {
+                // WE 的"重置过滤器"= 重建默认值（**不是清空**）再套 defaultfilterconfig。
+                // 已经是默认状态就不发请求（点着玩不该打网络）。
+                let before = self.discover_filter.clone();
+                self.discover_filter.reset();
+                if before == self.discover_filter {
+                    eprintln!("[filter] 重置过滤器：本来就是 WE 默认筛选，不发请求");
+                    return Task::none();
+                }
+                eprintln!(
+                    "[filter] 重置过滤器 → WE 默认（{}）",
+                    self.discover_filter.describe()
+                );
+                return self.arm_filter_debounce();
+            }
+
+            Message::DiscoverFilterDebounce(generation) => {
+                if !self.filter_debounce.fire(generation) {
+                    // 用户在这 300ms 里又点了一下 ⇒ 这一拍作废（**不发请求**）
+                    eprintln!(
+                        "[filter] 防抖丢弃 gen={generation}（已被 gen={} 取代，不发请求）",
+                        self.filter_debounce.current()
+                    );
+                    return Task::none();
+                }
+                // 筛选变了，页码必须回到 1（否则第 5 页 + 新筛选可能直接是空页）
+                self.discover_page = 1;
+                self.persist_filter();
+                self.filter_fetch_mark = workshop::browse_fetch_count();
+                let q = self.discover_filter.query();
+                eprintln!(
+                    "[filter] 防抖放行 #{n}（窗口 {w}ms · {desc} · 排除 {e} / 要求 {r}）",
+                    n = self.filter_debounce.releases,
+                    w = config::WS_FILTER_DEBOUNCE_MS,
+                    desc = self.discover_filter.describe(),
+                    e = q.excluded.len(),
+                    r = q.required.len()
+                );
+                return self.update(Message::DiscoverRunSearch);
+            }
+
             // ── 创意工坊：浏览 / 搜索 / 详情（**不跳网页**、零登录）──
+            //
             // 浏览与搜索走公开页面（`workshop` 模块，不需要任何身份）；登录 / 订阅 / 下载
-            // 这一整套入口已删除 —— 要动手请用详情面板的 [工坊页]（明写是浏览器）。
+            // 这一整套入口已按用户要求删除 —— 要动手请用详情面板的 [工坊页]（明写是浏览器）。
             Message::SelectWorkshop(id) => {
                 if self.wallpapers.iter().any(|w| w.id == id) {
                     // 已经下载到本地 ⇒ 走本地详情（有完整属性面板）
@@ -1868,7 +2186,7 @@ impl cosmic::Application for AppModel {
             }
 
             // 类型/标签筛选：**下拉选中**（不再是循环点击）—— 选中即改下标，
-            // 列表每帧由 `filtered_wallpapers` 现算，所以不用重扫磁盘。
+            // 列表每帧由 `filtered_wallpapers()` 现算，所以不用重扫磁盘。
             Message::SetTypeFilter(i) => {
                 self.type_filter = i.min(self.known_types.len());
             }
@@ -2040,7 +2358,8 @@ impl cosmic::Application for AppModel {
                 );
             }
 
-            // ── 已安装壁纸属性里的两个调节项──────────────────────
+            // ── 已安装壁纸属性里的两个调节项（2026-10-21）──────────────────────
+            //
             // 两个滑杆都**节流**：出站队列按 key 合并 + 55 ms 间隔（`native::OutQueue`，
             // ≈18 Hz ≤ 20 Hz 验收线），松手 `SliderRelease` 立刻放行终值。
             // 值也先写进本地字段 ⇒ 拖动中界面显示的就是最新值，不等内核回执。
@@ -2069,6 +2388,45 @@ impl cosmic::Application for AppModel {
                 native::flush_now();
             }
             // 脚本化拖动（验收）：推进一拍，然后**发和滑杆完全相同的那条 Message**。
+            Message::DragTick => {
+                let Some(d) = self.drag.clone() else {
+                    return Task::none();
+                };
+                if self.drag_start.is_some_and(|t| std::time::Instant::now() < t) {
+                    return Task::none();
+                }
+                let i = d.i.min(d.steps - 1);
+                let t = i as f32 / (d.steps - 1) as f32;
+                let v = d.from + (d.to - d.from) * t;
+                if let Some(d2) = self.drag.as_mut() {
+                    d2.i = d.i + 1;
+                }
+                let done = d.i + 1 >= d.steps;
+                if done {
+                    // 终值这一拍先发出去，下一拍收尾（松手）
+                    self.drag = None;
+                }
+                let ms = self
+                    .drag_start
+                    .map(|t| t.elapsed().as_millis())
+                    .unwrap_or(0);
+                eprintln!(
+                    "[拖动] t={ms}ms {}/{} ⇒ {}={v:.3}（10 ms 拍）",
+                    d.i + 1,
+                    d.steps,
+                    if d.knob == 0 { "time_scale" } else { "volume" }
+                );
+                let task = if d.knob == 0 {
+                    self.update(Message::TimeScaleSet(v))
+                } else {
+                    self.update(Message::MusicVolumeSet(v))
+                };
+                if done {
+                    return Task::batch(vec![task, self.update(Message::SliderRelease)]);
+                }
+                return task;
+            }
+
             // 「作者宣传图」开关（`Config::show_promo`，默认**开** = 面板里直接出作者的图）。
             // 关掉 = 不显示、也不联网；重新打开时若正选中一条、且它还有没缓存的宣传图，
             // 就顺手起后台下载流（不阻塞 UI）。
@@ -2150,6 +2508,39 @@ impl cosmic::Application for AppModel {
 }
 
 impl AppModel {
+    /// 排一次 300ms 的**防抖放行**：每勾一下就把代数 +1，然后排一条"睡 300ms 再带
+    /// 我的代数回来"的消息。到点时代数已被别人改掉 ⇒ 那一拍自己作废（不发请求）。
+    ///
+    /// 这就是"连点 5 次只发 1 次"的全部机制：5 条消息里只有最后一条的代数还是当前的。
+    fn arm_filter_debounce(&mut self) -> Task<cosmic::Action<Message>> {
+        let generation = self.filter_debounce.bump();
+        let wait = Duration::from_millis(config::WS_FILTER_DEBOUNCE_MS);
+        Task::perform(
+            async move {
+                tokio::time::sleep(wait).await;
+                generation
+            },
+            Message::DiscoverFilterDebounce,
+        )
+        .map(cosmic::Action::App)
+    }
+
+    /// 把筛选状态写回持久配置（`workshop_filter_state`，只写与默认值不同的项）。
+    ///
+    /// 写的是**本地小文件**（cosmic-config），不是网络 ⇒ 每次勾选都写也不心疼；
+    /// 用户要求"重启/切页后筛选状态保留"，所以不攒、不留到退出时再写（退出可能来不及）。
+    fn persist_filter(&mut self) {
+        self.config.workshop_filter_state = self.discover_filter.to_lines();
+        self.config.workshop_filter_open = self.discover_filter_open;
+        let Some(ctx) = &self.config_ctx else {
+            eprintln!("[filter] 没有配置句柄：这次筛选状态只在本次会话有效");
+            return;
+        };
+        if let Err(err) = self.config.write_entry(ctx) {
+            eprintln!("[filter] 筛选状态没写进配置（{err}）—— 重启后会回到上次成功保存的状态");
+        }
+    }
+
     pub fn update_title(&mut self) -> Task<cosmic::Action<Message>> {
         let mut window_title = fl!("app-title");
         if let Some(page) = self.nav.text(self.nav.active()) {
@@ -2166,9 +2557,11 @@ impl AppModel {
     // ── 性能档位：Config ⇄ 内核 ─────────────────────────────────────────────
 
     /// 改档位/逐项都走这里：写进 `Config` → 持久化 → 下发内核。
+    ///
     /// 档位名（`perf_preset`）是**反推**出来的：三项与某一档完全一致就是那一档，
     /// 否则是 `custom`（"自定义"）。这样逐项改回去时标签会自己跟上，不用记"最后点了哪个按钮"。
-    /// ⚠ **帧率不在档位里**：档位只管渲染尺寸/特效/睡眠。下发时 fps 按
+    ///
+    /// ⚠ **帧率不在档位里**（2026-10-14）：档位只管渲染尺寸/特效/睡眠。下发时 fps 按
     /// "**当前这条场景**"算（逐场景表 → 默认 60），由 [`Self::push_scene_perf`] 完成。
     fn commit_perf(&mut self, scale: String, effects: String, sleep: String, note: String) {
         self.config.render_scale = scale.clone();
@@ -2190,6 +2583,7 @@ impl AppModel {
     }
 
     /// 当前该按**哪条场景**算帧率：内核正在播的那条 → 上次下发的那条 → 界面选中的那条。
+    ///
     /// 这个顺序的理由：内核那条才是"用户正在看的"；还没连上内核时用 `native_last`
     /// （启动参数刚下发的那条）；都没有才退到面板里选中的（此时只是"将要播"）。
     fn current_scene_id(&self) -> Option<String> {
@@ -2203,15 +2597,16 @@ impl AppModel {
     }
 
     /// 把「这条场景的 fps + 全局三项（尺寸/特效/睡眠）」下发内核，并**留一行日志说明 fps 的来源**。
+    ///
     /// 这是**唯一**下发性能四项的地方 —— `apply` / 档位 / 逐项 / 微调 / 自适应 / 启动同步都走它。
-    /// 之前的问题是"每次应用都下发一个固定数、还把 drop-in 的 `WE_SCENE_FPS=60` 盖掉"；
+    /// 2026-10-14 之前的问题是"每次应用都下发一个固定数、还把 drop-in 的 `WE_SCENE_FPS=60` 盖掉"；
     /// 现在 fps 一律来自 [`config::fps_for_scene`]（表 → 默认 60），
     /// `force` 只给"刚由用户 / 自适应定下的值"用，好让日志如实写"来源=用户选择 / 自适应"。
     fn push_scene_perf(&mut self, id: Option<&str>, force: Option<(u64, config::FpsSource)>, why: &str) {
         let (scale, effects, sleep) = config::effective(&self.config);
         let (fps, src) = resolve_fps(&self.scene_fps, id, force);
         let scene = id.unwrap_or("(无场景)");
-        // 来源必须写清楚，绝不静默覆盖（来源=逐场景表/用户选择/默认/自适应）。
+        // ★ 用户要求的那一行：来源必须写清楚，绝不静默覆盖（来源=逐场景表/用户选择/默认/自适应）。
         eprintln!(
             "[控制面] 下发 fps={fps}（来源={}）· 场景={scene} · scale={scale} effects={effects} sleep={sleep} · {why}",
             src.label()
@@ -2278,10 +2673,12 @@ impl AppModel {
 
     /// 自适应：用内核**累计帧数**的两次采样算**实际**帧率；持续明显跑不到就把本场景降到 30，
     /// 负载长期干净后**升回** 60。
+    ///
     /// 只在"自动档"上动手（逐场景表里没有记录 —— 用户钉过的场景一个字都不动），
     /// 而且每次**判定**都必须说话：日志一行 + `adapt_note` 显示在设置页，降 / 升 / 不降都出声。
     /// 采样源是 `status.frames`（内核每渲染一帧 +1，`status` 里就有），所以这是**实测**而不是猜。
-    /// **先看机器有没有别的负载**（修）：`/proc/loadavg` 明显高 ⇒ 这次实测值反映的是
+    ///
+    /// **先看机器有没有别的负载**（2026-10-15 修）：`/proc/loadavg` 明显高 ⇒ 这次实测值反映的是
     /// "别人在抢 CPU / 内存带宽"（本机是 APU，GPU 与 CPU 共享内存带宽），不是这条场景的能力
     /// ⇒ 整个观测丢掉、**不判定**（既不 +1 也不清零）。降档后连续 `ADAPT_RECOVER_STREAK` 条
     /// 干净样本 + 距降档 `ADAPT_UPGRADE_MIN_SECS` 秒 ⇒ 升回（GPU 打满则判为真重场景，不升）。
@@ -2458,6 +2855,7 @@ impl AppModel {
     }
 
     /// `--native-apply-first`：把第一条「内核能播」的下发给自研内核。
+    ///
     /// ⚠ 这段逻辑以前**只写在"daemon 回了列表"那个分支里** ⇒ 没有 daemon 时旗标永远不触发
     /// （验证脚本/headless 用法直接失效）。现在本地扫描这条路也会调它。
     fn maybe_native_apply_first(&mut self) {
@@ -2500,13 +2898,13 @@ impl AppModel {
     // ── 逐壁纸属性（数据驱动：全部来自 project.json 的 general.properties）──
 
     /// 属性覆盖表落盘（**节流**）。
+    ///
     /// 拖动色盘/滑块时 `set_prop` 每帧都被调一次（30~60 次/秒），逐条 `fs::write`
     /// 整个 JSON 纯属白扔 IO，而且全在 **UI 线程**上。这里：
-///
     /// * `force=false` ⇒ 距上次落盘不到 250 ms 就只 Mark dirty（内存里的 `prop_edits`
-    /// 已经是最新值，界面读的是它，不会看到旧值）；
-///
+    ///   已经是最新值，界面读的是它，不会看到旧值）；
     /// * `force=true`（松手 / 3 秒 status tick）⇒ 一定落盘。
+    ///
     /// 最坏情况：拖动中崩进程 ⇒ 丢掉最后 ≤250 ms 的预览值（松手那一下会强落，所以
     /// 正常路径不会丢）。
     fn persist_props(&mut self, force: bool) {
@@ -2534,9 +2932,9 @@ impl AppModel {
         // 落盘节流（拖动时这个函数**每帧**被调一次）：内存里改完仍然立刻可见，
         // 只是不每帧都写盘 —— 见 `persist_props`。
         self.persist_props(false);
-        // 除了落盘，**还要下发给正在播放的那张壁纸**（README 承诺"改完立即生效"）。
-        // 走内核的通用控制面命令 `set-prop`（名值对，由渲染器按 project.json 的 general.properties
-        // 解释；内核与渲染器都不针对属性名/类型做特判）。若改的不是当前在播的那张，只落盘。
+        // ★ 2026-10-12：除了落盘，**还要下发给正在播放的那张壁纸**（README 承诺"改完立即生效"）。
+        //   走内核的通用控制面命令 `set-prop`（名值对，由渲染器按 project.json 的 general.properties
+        //   解释；内核与渲染器都不针对属性名/类型做特判）。若改的不是当前在播的那张，只落盘。
         if !self.native.is_none() {
             let dir = self
                 .wallpapers
@@ -2555,12 +2953,13 @@ impl AppModel {
     /// 画面色彩六项的**唯一**落点：写进 `Config` → 持久化 → （该下发时）下发内核。
     /// `ColorStep`（± 按钮）/ `ColorSet`（属性面板滑块）/ `ColorReset` 三条路都走它 ——
     /// 三处一份逻辑，不会漂。
-    /// **按壁纸 id 分槽**：
+    ///
+    /// ★ 2026-10-12：**按壁纸 id 分槽**（用户要求「不要全局生效，而是针对那一个壁纸」）：
     /// 有选中就写进这条壁纸自己的槽（值为中性 ⇒ 删掉这条覆盖，等于回到默认）。
-    /// **没有选中的壁纸 ⇒ 一个字也不写**（既不落盘也不下发）。
-    /// 以前无选中时会把值写进**全局** `color`，让所有还没记过槽的壁纸一起被改掉 ——
-    /// 那条真实路径是 `--perf-msg color-reset`（性能自检在"选中"之前就按了按钮），
-    /// 它把分槽设计打穿了。落点判定拆成纯函数 [`write_color`]，单测直接钉它。
+    /// ★ 2026-10-14：**没有选中的壁纸 ⇒ 一个字也不写**（既不落盘也不下发）。
+    ///   以前无选中时会把值写进**全局** `color`，让所有还没记过槽的壁纸一起被改掉 ——
+    ///   那条真实路径是 `--perf-msg color-reset`（性能自检在"选中"之前就按了按钮），
+    ///   它把分槽设计打穿了。落点判定拆成纯函数 [`write_color`]，单测直接钉它。
     fn set_color(&mut self, c: [f32; 6]) {
         let is_default = c == [1.0f32, 1.0, 1.0, 0.0, 0.0, 1.0];
         let (who, s) = match write_color(&mut self.config, self.selected.as_deref(), c) {
@@ -2607,7 +3006,8 @@ impl AppModel {
     /// 当前**在编辑的那条**壁纸的画面色彩：有选中就取这条的槽（分槽优先 ⇒ 退回旧的全局值），
     /// 没选中才取全局。属性面板那六个滑块与 `ColorStep/ColorSet/ColorReset` 都读它 ——
     /// 只有一处口径，界面显示 / 落盘 / 下发不会漂。
-    /// ⚠ 读与写不对称：**没有选中时**这里仍会读出旧的全局值（当"默认档"显示用），
+    ///
+    /// ⚠ 读与写不对称（2026-10-14）：**没有选中时**这里仍会读出旧的全局值（当"默认档"显示用），
     /// 但 [`AppModel::set_color`] / [`write_color`] 在那种情况下**什么都不写** —— 见那里的注释。
     fn current_color(&self) -> [f32; 6] {
         match self.selected.as_deref() {
@@ -2617,10 +3017,11 @@ impl AppModel {
     }
 
     /// 下发一条画面色彩到内核，并留一行**journal 可见**的证据。
+    ///
     /// ⚠ 内核对 `{"cmd":"set","color":…}` **不打印任何日志**（它只给 `set-prop` 打；
-    /// 实测两条命令的回执里也没有 color 字段）⇒ "确实下发了"这条证据只能留在**界面这一侧**
-    /// 的控制面日志里（标识 `[控制面]`，和内核自己的日志同一批格式）。配合截图（画面真的变了）
-    /// 一起看才算完整证据链。
+    ///   实测两条命令的回执里也没有 color 字段）⇒ "确实下发了"这条证据只能留在**界面这一侧**
+    ///   的控制面日志里（标识 `[控制面]`，和内核自己的日志同一批格式）。配合截图（画面真的变了）
+    ///   一起看才算完整证据链。
     fn push_color(&mut self, col: &str, why: &str) {
         eprintln!("[控制面] set-color 值={col} · {why}");
         native::request_async(native::cmd_set_color(col));
@@ -2647,12 +3048,13 @@ impl AppModel {
 
     /// 把某条壁纸下发给自研内核。详情面板 [应用] 按钮与 `--apply-id` 的**补跑**都走它
     /// （一处口径，不会漂）。
+    ///
     /// 一次做三件事：
-    /// ① **下发内容** —— scene 包 ⇒ `kind=scene` + 目录；视频/图片 ⇒ 对应文件（直接问磁盘，不问 daemon）；
-    /// ② **整套作者属性**（`clear=true`）—— 内核先清空覆盖表再写，避免上一张的属性残留
-    /// （属性名跨壁纸重名很常见，例如两张壁纸都有 `newproperty`）；
-    /// ③ **这条壁纸自己的画面色彩**（分槽）—— 内核那层色彩是一趟**全局** shader，
-    /// 不跟着换就会把上一条的偏色带到这一条身上（这正是用户要修的问题）。
+    ///   ① **下发内容** —— scene 包 ⇒ `kind=scene` + 目录；视频/图片 ⇒ 对应文件（直接问磁盘，不问 daemon）；
+    ///   ② **整套作者属性**（`clear=true`）—— 内核先清空覆盖表再写，避免上一张的属性残留
+    ///      （属性名跨壁纸重名很常见，例如两张壁纸都有 `newproperty`）；
+    ///   ③ **这条壁纸自己的画面色彩**（分槽）—— 内核那层色彩是一趟**全局** shader，
+    ///      不跟着换就会把上一条的偏色带到这一条身上（这正是用户要修的问题）。
     fn apply_native(&mut self, id: &str) {
         let picked = self
             .wallpapers
@@ -2682,9 +3084,9 @@ impl AppModel {
                     let _ = native::request_async(native::cmd_set_props(&props, true));
                     let col = config::color_for_id(&self.config, id).to_string();
                     self.push_color(&col, &format!("切换壁纸 {id}"));
-                    // **这条场景自己的帧率**也要跟着切。内核的 fps 是**全局运行态**
-                    // （`set` 只改字段、不重建），不重发就会把上一条的帧率带到这一条身上 ——
-                    // 重场景 30 / 轻场景 60 就是靠这一下发成立的。来源写进那行日志。
+                    // ★ 2026-10-14：**这条场景自己的帧率**也要跟着切。内核的 fps 是**全局运行态**
+                    //   （`set` 只改字段、不重建），不重发就会把上一条的帧率带到这一条身上 ——
+                    //   重场景 30 / 轻场景 60 就是靠这一下发成立的。来源写进那行日志。
                     self.push_scene_perf(Some(id), None, &format!("应用壁纸 {id}"));
                 } else {
                     self.error = Some("下发内核指令失败：后台没在跑".into());
@@ -3036,6 +3438,7 @@ impl AppModel {
             .into()
         } else {
             // **自动换行**：按窗口**实际宽度**算每行放几个，再用 iced 的 row 分块。
+            //
             // ⚠ 别用 `widget::flex_row` / `widget::grid` ✗ —— 它们底下的布局会把格子沿纵向
             // 拉到行高（实测格子 580px 而内容只有 230px ⇒ 每行下面一大块空白）。
             // iced 自己的 `row` 不拉伸子项 ⇒ 高度正常；列数则由 `win_w`（订阅窗口 resize 得到）算。
@@ -3075,8 +3478,8 @@ impl AppModel {
         let selected = self.selected.as_deref() == Some(entry.id.as_str());
 
         let thumb: Element<_> = if !entry.preview.is_empty() && Path::new(&entry.preview).exists() {
-            // CPU 预缩放（Lanczos3）到卡片**正好那么大** ⇒ 上屏 1:1，不糊也不锯齿
-            // （iced/wgpu 那条路没有 mipmap，直接缩原图会走样，见 `thumb_from_path`）。
+            // ★ CPU 预缩放（Lanczos3）到卡片**正好那么大** ⇒ 上屏 1:1，不糊也不锯齿
+            //   （iced/wgpu 那条路没有 mipmap，直接缩原图会走样，见 `thumb_from_path`）。
             let handle = thumb_from_path(&entry.preview, self.card_w() as u32, self.card_h() as u32);
             widget::image::Image::new(handle)
                 .content_fit(cosmic::iced::ContentFit::Cover)
@@ -3161,7 +3564,7 @@ impl AppModel {
         self.view_workshop_body(true)
     }
 
-    /// 创意工坊页：关键词搜索 + 排序 + 翻页（缩略图网格，和发现页一致；用户 要求）。
+    /// 创意工坊页：关键词搜索 + 排序 + 翻页（缩略图网格，和发现页一致；用户 2026-10-21 要求）。
     fn view_workshop(&self) -> Element<'_, Message> {
         self.view_workshop_body(true)
     }
@@ -3248,6 +3651,15 @@ impl AppModel {
         } else {
             status.push("同一 id 只列一次（无重复）".into());
         }
+        // 筛选证据：Steam 自己报的**工坊总条数**（筛选一变它就变），以及这次发了几个组合。
+        // 没有筛选时也印，作为"基准数"（实测无筛选 2 923 758 → Anime 731 392）。
+        if let Some(total) = self.discover_total {
+            status.push(if self.discover_queries > 1 {
+                format!("Steam 报共 {total} 条（{} 个组合合计）", self.discover_queries)
+            } else {
+                format!("Steam 报共 {total} 条")
+            });
+        }
         if !self.discover_items.is_empty() {
             status.push(format!("其中 {missing} 条未下载"));
         }
@@ -3288,15 +3700,16 @@ impl AppModel {
         }
 
         // 状态条装进一张卡片里：这一行是小字、又要贴着壁纸看（窗口是半透明的），
-        // 直接浮在窗口底色上在浅色壁纸前几乎读不出来。给它一层主题底色，字才看得见。
+        // 直接浮在窗口底色上在浅色壁纸前几乎读不出来（实测）。给它一层主题底色，字才看得见。
         let status_card = widget::container(status_col)
             .width(Length::Fill)
             .padding([4.0, 8.0])
             .style(we_ui::card_style);
 
         if self.discover_items.is_empty() && !self.discover_loading {
-            return widget::column::with_capacity(3)
+            return widget::column::with_capacity(4)
                 .push(header)
+                .push(self.view_workshop_filter())
                 .push(status_card)
                 .push(we_ui::label(
                     "点「搜索」拉取创意工坊的热门内容（可先不填关键词）。下载后的条目会自动出现在「已安装」页。",
@@ -3340,8 +3753,9 @@ impl AppModel {
             widget::scrollable(list).height(Length::Fill).into()
         };
 
-        widget::column::with_capacity(3)
+        widget::column::with_capacity(4)
             .push(header)
+            .push(self.view_workshop_filter())
             .push(status_card)
             .push(body)
             .spacing(spacing.space_s)
@@ -3349,7 +3763,286 @@ impl AppModel {
             .into()
     }
 
+    /// 工坊页的「筛选」区：**照抄 Win 版 WE 面板的结构与语义**。
+    ///
+    /// * 六组、**顺序与 WE 一致**（`仅显示` → 类型 → 年龄分级 → 分辨率 → 来源 → 标签）；
+    /// * **勾选 = 不排除**（黑名单取反，见 `workshop::Filter::query`）：
+    ///   组内只排"未勾"的 = OR，多组各自的排除叠加在**一条**查询里 = AND；
+    /// * 默认收起状态也照抄（`Group::collapsed`：类型/年龄分级/分辨率收起，来源/标签展开）；
+    /// * 「重置过滤器」= **回到默认筛选**（不是清空），并且套 `defaultfilterconfig`；
+    /// * 分辨率 5 个宽高比子组各带「所有 / 无」，标签组在组头上一对；
+    /// * **防抖**：勾选只改状态 + 排一条 300ms 定时消息，不立刻打网络。
+    fn view_workshop_filter(&self) -> Element<'_, Message> {
+        let spacing = cosmic::theme::spacing();
+        let changed = self.discover_filter.changed_count();
+        let head_label = if changed == 0 {
+            "筛选".to_string()
+        } else {
+            format!("筛选 · {changed} 处改动")
+        };
+        let head = widget::row::with_capacity(3)
+            .push(we_ui::icon_button(
+                head_label,
+                if self.discover_filter_open {
+                    "go-up-symbolic"
+                } else {
+                    "go-down-symbolic"
+                },
+                if changed > 0 {
+                    we_ui::filled_class()
+                } else {
+                    we_ui::gray_class()
+                },
+                Message::DiscoverFilterToggle,
+            ))
+            .push(we_ui::icon_button(
+                "重置过滤器",
+                "edit-undo-symbolic",
+                we_ui::gray_class(),
+                Message::DiscoverFilterReset,
+            ))
+            .push(we_ui::label(
+                "勾选 = 不排除（WE 的黑名单取反）· 组内任一即可 / 组间同时满足 · 一页只发一次请求",
+                11.0,
+                we_ui::ink_dim(),
+            ))
+            .spacing(spacing.space_xs)
+            .align_y(Alignment::Center);
+
+        let mut col = widget::column::with_capacity(8)
+            .push(head)
+            .spacing(spacing.space_xxs);
+        if !self.discover_filter_open {
+            // 收起时只留摘要：`类型 4/5 · 标签 20/25`（默认状态显示"WE 默认筛选"）
+            col = col.push(we_ui::label(
+                self.discover_filter.describe(),
+                11.0,
+                we_ui::ink_text(),
+            ));
+            return widget::container(col)
+                .width(Length::Fill)
+                .padding([4.0, 8.0])
+                .style(we_ui::card_style)
+                .into();
+        }
+
+        // 「仅显示」：WE 里唯一不可折叠的 groupBox，勾上 = requiredtags / 额外排除
+        col = col.push(self.view_show_only());
+        for group in &workshop::GROUPS {
+            col = col.push(self.view_filter_group(group));
+        }
+        col = col.push(we_ui::label(
+            "词表与默认值来自 Win 版 WE 的明文面板（6 组 / 真实 tag 值）—— 不含 4K 之类简写：工坊没有那个标签",
+            10.0,
+            we_ui::ink_dim(),
+        ));
+        widget::container(col)
+            .width(Length::Fill)
+            .padding([4.0, 8.0])
+            .style(we_ui::card_style)
+            .into()
+    }
+
+    /// 某一组现在是展开吗？用户没点过就用 `Group::collapsed`（WE 的默认折叠态）。
+    fn filter_group_open(&self, key: &str, default_collapsed: bool) -> bool {
+        match self.filter_collapsed.get(key) {
+            Some(open) => *open,
+            None => !default_collapsed,
+        }
+    }
+
+    /// 「仅显示」组（不可折叠）：`Approved` → `requiredtags[]`；手机兼容 → 额外排除两项。
+    fn view_show_only(&self) -> Element<'_, Message> {
+        let mut line = widget::row::with_capacity(3)
+            .push(
+                widget::container(we_ui::label("仅显示", 11.0, we_ui::ink_dim()))
+                    .width(Length::Fixed(56.0)),
+            )
+            .spacing(6.0)
+            .align_y(Alignment::Center);
+        for opt in &workshop::SHOW_ONLY {
+            let on = self.discover_filter.only(opt.key);
+            let text = if on {
+                format!("✓ {}", opt.label)
+            } else {
+                opt.label.to_string()
+            };
+            line = line.push(
+                widget::button::custom(widget::text(text).size(11))
+                    .class(if on {
+                        we_ui::filled_class()
+                    } else {
+                        we_ui::ghost_class()
+                    })
+                    .padding([2, 6])
+                    .on_press_down(Message::DiscoverFilterToggleOnly(opt.key.to_string())),
+            );
+        }
+        widget::column::with_capacity(2)
+            .push(line)
+            .push(we_ui::label(
+                "WE 还有「我的收藏」（要登录态）和 2 个 utility 标签（tag 由运行时下发、逆向未取到）—— 这两样不做",
+                10.0,
+                we_ui::ink_dim(),
+            ))
+            .spacing(2.0)
+            .into()
+    }
+
+    /// 一个筛选组：可折叠的组头（带"（已筛选）"角标）+ 若干小节。
+    fn view_filter_group(&self, group: &'static workshop::Group) -> Element<'_, Message> {
+        let open = self.filter_group_open(group.key, group.collapsed);
+        let changed = self.discover_filter.group_changed(group.key);
+        let title_row = widget::row::with_capacity(2)
+            .push(widget::text(if open { "▾" } else { "▸" }).size(11))
+            .push(we_ui::label(
+                group.title,
+                11.0,
+                if changed {
+                    we_ui::ink_text()
+                } else {
+                    we_ui::ink_dim()
+                },
+            ))
+            .spacing(4)
+            .align_y(Alignment::Center);
+        let mut head = widget::row::with_capacity(4)
+            .push(
+                widget::button::custom(title_row)
+                    .class(we_ui::bare_class())
+                    .padding([1, 4])
+                    .on_press_down(Message::DiscoverFilterCollapse(group.key.to_string())),
+            )
+            .spacing(6.0)
+            .align_y(Alignment::Center);
+        if changed {
+            head = head.push(we_ui::label("（已筛选）", 10.0, we_ui::ink_text()));
+        }
+        if group.all_none {
+            // 标签组的"所有 / 无"在组头上（分辨率的那几对在子组上）
+            let section = group.sections.first().map(|s| s.key).unwrap_or("");
+            head = head.push(self.all_none_button(
+                "所有",
+                Message::DiscoverFilterAllNone(group.key.to_string(), section.to_string(), true),
+            ));
+            head = head.push(self.all_none_button(
+                "无",
+                Message::DiscoverFilterAllNone(group.key.to_string(), section.to_string(), false),
+            ));
+        }
+        if !group.note.is_empty() {
+            head = head.push(we_ui::label(group.note, 10.0, we_ui::ink_dim()));
+        }
+
+        let mut col = widget::column::with_capacity(2)
+            .push(head)
+            .spacing(2.0);
+        if !open {
+            return col.into();
+        }
+
+        // 每个小节的 chip 按窗口宽度分块（不用 flex_row：它会把格子纵向拉满）
+        let per_row = (((self.win_w - 140.0) / 132.0).floor() as usize).clamp(2, 9);
+        for section in group.sections {
+            // 小标题行：有标题、或本节自带"所有/无"（且不是组头那一对）时才印
+            if !section.title.is_empty() || (section.all_none && !group.all_none) {
+                let mut line = widget::row::with_capacity(3)
+                    .spacing(6.0)
+                    .align_y(Alignment::Center);
+                if !section.title.is_empty() {
+                    line = line.push(
+                        widget::container(we_ui::label(section.title, 10.0, we_ui::ink_dim()))
+                            .width(Length::Fixed(84.0)),
+                    );
+                }
+                if section.all_none && !group.all_none {
+                    line = line.push(self.all_none_button(
+                        "所有",
+                        Message::DiscoverFilterAllNone(
+                            group.key.to_string(),
+                            section.key.to_string(),
+                            true,
+                        ),
+                    ));
+                    line = line.push(self.all_none_button(
+                        "无",
+                        Message::DiscoverFilterAllNone(
+                            group.key.to_string(),
+                            section.key.to_string(),
+                            false,
+                        ),
+                    ));
+                }
+                col = col.push(line);
+            }
+            let mut chunk: Vec<Element<'_, Message>> = Vec::with_capacity(per_row);
+            let mut rows =
+                widget::column::with_capacity(section.opts.len() / per_row + 1).spacing(4.0);
+            for opt in section.opts {
+                let on = self.discover_filter.checked(group.key, opt.tag);
+                chunk.push(self.filter_chip(group, opt, on));
+                if chunk.len() == per_row {
+                    rows =
+                        rows.push(widget::row::with_children(std::mem::take(&mut chunk)).spacing(4.0));
+                }
+            }
+            if !chunk.is_empty() {
+                rows = rows.push(widget::row::with_children(chunk).spacing(4.0));
+            }
+            // 缩进一格，让"子组"在视觉上归到组头下面
+            col = col.push(
+                widget::container(rows)
+                    .padding([0.0, 12.0])
+                    .width(Length::Fill),
+            );
+        }
+        col.into()
+    }
+
+    /// 「所有 / 无」小按钮（分辨率每个子组一对、标签组一对）
+    fn all_none_button(&self, text: &'static str, msg: Message) -> Element<'_, Message> {
+        widget::button::custom(widget::text(text).size(10))
+            .class(we_ui::ghost_class())
+            .padding([0, 5])
+            .on_press_down(msg)
+            .into()
+    }
+
+    /// 一个筛选 chip：**勾上 = 强调色实心**（= 不排除），未勾 = 细描边（= 会被排除）。
+    /// 来源组（`query_backed == false`）在浏览页**置灰不可点**：WE 里整组只在
+    /// "已安装"源出现，它不参与工坊查询。
+    fn filter_chip(
+        &self,
+        group: &'static workshop::Group,
+        opt: &'static workshop::Opt,
+        on: bool,
+    ) -> Element<'_, Message> {
+        if !group.query_backed {
+            return widget::container(we_ui::label(opt.label, 11.0, we_ui::ink_dim()))
+                .padding([2, 6])
+                .into();
+        }
+        let text = if on {
+            format!("✓ {}", opt.label)
+        } else {
+            opt.label.to_string()
+        };
+        widget::button::custom(widget::text(text).size(11))
+            .class(if on {
+                we_ui::filled_class()
+            } else {
+                we_ui::ghost_class()
+            })
+            .padding([2, 6])
+            .on_press_down(Message::DiscoverFilterToggleTag(
+                group.key.to_string(),
+                opt.tag.to_string(),
+            ))
+            .into()
+    }
+
     /// 工坊条目：16:9 格子（发现页用，和已安装页同一种格子）
+    ///
     /// `downloaded` = 本地已有这条（标题带 ✓）。没有订阅角标 —— 登录/订阅整套 UI 已删除。
     fn workshop_tile<'a>(
         &'a self,
@@ -3509,37 +4202,16 @@ impl AppModel {
 
 }
 
-/// 内核二进制的位置。
-///
-/// 查找顺序：`WPHUB_KERNEL` 指定 → `~/.local/bin/we-native`（装好的）
-/// → 当前可执行文件同目录（`cargo build` 出来的两个二进制挨着）
-/// → `PATH` 里的 `we-native`。
+/// 自研内核二进制（方案 B 的产物）。
+/// 优先用**装好的** `~/.local/bin/we-native`；没有就退回源码目录里的 release 产物（开发时方便）。
 fn native_kernel_binary() -> std::path::PathBuf {
-    if let Some(p) = std::env::var_os("WPHUB_KERNEL") {
-        return std::path::PathBuf::from(p);
-    }
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/home/dev".into());
     let installed = std::path::PathBuf::from(&home).join(".local/bin/we-native");
     if installed.exists() {
         return installed;
     }
-    if let Ok(exe) = std::env::current_exe()
-        && let Some(dir) = exe.parent()
-    {
-        let sibling = dir.join("we-native");
-        if sibling.exists() {
-            return sibling;
-        }
-    }
-    if let Ok(out) = std::process::Command::new("which").arg("we-native").output()
-        && out.status.success()
-    {
-        let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        if !p.is_empty() {
-            return std::path::PathBuf::from(p);
-        }
-    }
-    std::path::PathBuf::from("we-native")
+    std::path::PathBuf::from(home)
+        .join("Projects/wallpaper-hub/spikes/003-native-layer-shell/target/release/we-native")
 }
 
 fn native_running() -> bool {
@@ -3558,7 +4230,7 @@ fn spawn_native_kernel() -> Result<String, String> {
     let bin = native_kernel_binary();
     if !bin.exists() {
         return Err(format!(
-            "找不到自研内核：{}（先 `cargo build --release -p we-native`，或设 WPHUB_KERNEL 指向它）",
+            "找不到自研内核：{}（先在 spike 目录 cargo build --release）",
             bin.display()
         ));
     }
@@ -3575,6 +4247,7 @@ fn spawn_native_kernel() -> Result<String, String> {
 }
 
 /// 确认自研内核在跑（waywallen 已彻底移除，不再需要"先停对方"这一步）。
+///
 /// 界面里现在没有直接调用它 —— 内核由 systemd 服务托管。保留是因为它仍是"确保后端可用"的
 /// 正确动作，将来做命令行/自检要用。
 #[allow(dead_code)]
@@ -3583,6 +4256,7 @@ fn switch_to_native() -> Result<String, String> {
 }
 
 /// 重启自研内核服务。
+///
 /// 为什么需要它：会话锁屏时 layer surface 会被销毁，而内核**不会重建自己的 surface**，于是变成
 /// 「进程活着、socket 活着、帧也照收，但屏幕上什么都没有」的僵尸状态 —— 表现为：渲染器在跑、
 /// `apply` 也成功，可桌面上看不出任何变化。重启内核服务即可恢复。
@@ -3605,6 +4279,7 @@ fn restart_native_kernel() -> Result<String, String> {
 // （原来这里还有 switch_to_waywallen —— waywallen 后端已整体移除，函数一并删掉。）
 
 /// 去掉壁纸/工坊文本里的 HTML 与 BBCode 标记。
+///
 /// WE 的 `project.json` 和创意工坊文本里常带 `<style>…</style>`、`<b>`、`[b]` 这类标记，
 /// 原样显示就是乱码（用户明确提过这点）。
 fn strip_markup(text: &str) -> String {
@@ -3746,9 +4421,9 @@ fn color_to_config(c: &[f32; 6]) -> String {
 /// 一次调色**写到哪** —— 从 `set_color` 里拆出来的纯函数（落点判定只在这一处，改错了单测先响）。
 ///
 /// * 有选中的壁纸 ⇒ 只动**这条壁纸自己的槽**（[`config::Config::color_by_id`]）；中性值 = 删掉这条覆盖；
-///
 /// * **没有选中的壁纸 ⇒ `Nothing`，一个字也不写**。
-/// ⚠ （实测的 bug）：以前这条 `None` 分支会把值写进**全局** `color`（`Config::color`）。
+///
+/// ⚠ 2026-10-14（实测的 bug）：以前这条 `None` 分支会把值写进**全局** `color`（`Config::color`）。
 /// 那个字段只是**老配置的迁移默认值**，写它等于把所有"还没记过槽"的壁纸一起改掉 ——
 /// 真实触发路径是 `--perf-msg color-reset`：性能自检在界面**选中任何壁纸之前**就按了那个按钮
 /// （见启动参数那一段的顺序），于是通用色彩落到了全局，把"按壁纸 id 分槽"的设计打穿。
@@ -3845,7 +4520,8 @@ impl AppModel {
     }
 
     /// 右侧面板的「工坊条目」一节：**还没下载到本地**的条目也能在程序里看，
-    /// 只读：浏览 / 详情 / 工坊页链接复制。**没有任何登录、订阅、下载入口**。
+    /// 只读：浏览 / 详情 / 工坊页链接复制。**没有任何登录、订阅、下载入口**（用户要求删干净）。
+    ///
     fn view_workshop_detail(&self, item: &workshop::Item) -> Element<'_, Message> {
         let spacing = cosmic::theme::spacing();
         let id = item.id.clone();
@@ -3976,9 +4652,11 @@ impl AppModel {
     /// 右侧详情/属性面板（WE 观感）：大预览图 → 居中标题 → 评分行 → chips →
     /// 红色通栏按钮 → 小按钮行 → 「属性」分组（**引擎项 → 【宣传图】 → 细分割线 → 作者项**）
     /// →「您的预设」→ 确认/取消。
-    /// 「宣传图」段的位置：**壁纸参数区的顶部** —— 紧跟在「通用色彩调整」
+    ///
+    /// 「宣传图」段的位置（2026-10-13 用户要求）：**壁纸参数区的顶部** —— 紧跟在「通用色彩调整」
     /// 那一组引擎项（对齐方式 + 六项色彩 + 重新下发按钮）之后、作者自定义属性之前；
     /// 原来是画在面板最上面（缩览图 / chips 一带），位置不对。
+    ///
     /// 属性区**完全数据驱动**：逐条遍历 `project.json` 的 `general.properties`，
     /// 按每条自己的 `type` 出控件（bool/slider/color/combo/text），改完立即写回覆盖表
     /// 并落盘 —— 不认属性名、不特判。
@@ -4124,8 +4802,8 @@ impl AppModel {
         );
 
         // 7) 「属性」分组：**上半 = 引擎内置项（带小图标）** → 一条细分割线 →
-        // **下半 = 作者自定义项（只有标签 + 控件、不带图标）**，逐条遍历
-        // general.properties（数据驱动、foreach，不认属性名）
+        //    **下半 = 作者自定义项（只有标签 + 控件、不带图标）**，逐条遍历
+        //    general.properties（数据驱动、foreach，不认属性名）
         col = col.push(we_ui::section("属性"));
         let props = parse_props(&entry.user_properties_schema);
 
@@ -4135,7 +4813,7 @@ impl AppModel {
 
         // ── 引擎内置（本程序自己的运行时项：取景 + 画面色彩）──
         rows = rows.push(self.engine_row_fit());
-        // 用户 「已安装壁纸的属性里加两个调节项」—— 播放速度 / 场景音频音量。
+        // 用户 2026-10-21：「已安装壁纸的属性里加两个调节项」—— 播放速度 / 场景音频音量。
         // 都是**内核运行时**旋钮（跟壁纸作者属性无关，也不落盘到 project.json）。
         rows = rows.push(self.engine_row_speed());
         rows = rows.push(self.engine_row_volume());
@@ -4144,13 +4822,13 @@ impl AppModel {
         }
         rows = rows.push(self.engine_row_actions());
 
-        // ── **作者嵌入的宣传图**：放在**壁纸参数区的顶部**（用户 「宣传图一般是
-        // 壁纸参数的顶部，而不是边栏的顶部，应该在通用色彩设置的下方」）——
-        // 即紧跟上面「通用色彩调整」这一组（引擎项，含对齐方式/六项色彩/重新下发按钮）之后、
-        // 作者自定义项之前。原来是画在面板最上面（缩览图 / chips 一带），位置不对。
-        // 数据仍来自 `promo` 模块（遍历 project.json 每条属性的 `text` + `description`；
-        // 不新建第二套抓取），**默认展示**（`Config::show_promo` 默认 true，开关保留）：
-        // 开着就出这一段；关掉而这条又有图时，给一行开关提示。
+        // ── **作者嵌入的宣传图**：放在**壁纸参数区的顶部**（用户 2026-10-13：「宣传图一般是
+        //    壁纸参数的顶部，而不是边栏的顶部，应该在通用色彩设置的下方」）——
+        //    即紧跟上面「通用色彩调整」这一组（引擎项，含对齐方式/六项色彩/重新下发按钮）之后、
+        //    作者自定义项之前。原来是画在面板最上面（缩览图 / chips 一带），位置不对。
+        //    数据仍来自 `promo` 模块（遍历 project.json 每条属性的 `text` + `description`；
+        //    不新建第二套抓取），**默认展示**（`Config::show_promo` 默认 true，开关保留）：
+        //    开着就出这一段；关掉而这条又有图时，给一行开关提示。
         if self.config.show_promo {
             if let Some(section) = self.view_promo(&id, preview_w) {
                 rows = rows.push(section);
@@ -4163,9 +4841,11 @@ impl AppModel {
         rows = rows.push(we_ui::row_divider());
 
         // ── 作者自定义（project.json 的 general.properties）──
+        //
         // **按每条自己的呈现形态出东西**（`PropForm`，判据只看 type / text / value）：
         // 可编辑项才给控件；作者的标题只读加粗；图片型整行不出（已在「宣传图」段）；
         // 空 text / 本地化键跳过。这样面板里不会再有「没意义的键 + 输入框」。
+        //
         // **「依赖显示」门控**（`condition` 字段，作者写的 `<兄弟属性key>.value == <字面量>`）：
         // 条件不成立这一行就不画。判据全在 `parse_condition` / `cond_holds` 里（数据驱动，
         // 不按属性名/壁纸名特判）；求值读的是**当前值**（覆盖表优先，与控件上显示的一致），
@@ -4236,7 +4916,7 @@ impl AppModel {
         );
 
         // 8) 「您的预设」：保存 / 加载 / 应用到所有壁纸 / 分享 JSON / 重置
-        // （参考图 7-4 底部那五连：两个半宽 + 三个通栏，最后一个是红底）
+        //    （参考图 7-4 底部那五连：两个半宽 + 三个通栏，最后一个是红底）
         col = col.push(we_ui::section("您的预设"));
         col = col.push(
             widget::container(self.view_presets(&id, &props))
@@ -4255,12 +4935,12 @@ impl AppModel {
                 .class(we_ui::filled_class())
                 .padding([5.0, 8.0])
                 .width(Length::FillPortion(1))
-                // 按下即触发（on_press_down），不等 release：
-                // 实测这个底栏按钮**按下能进、松开不触发** —— 按下的
-                // `cursor.is_over(bounds)` 为真（rect 852,828.8,258x26.8），松开时同一位置
-                // 却判定为"不在按钮上"（事件仍被 Captured ⇒ 走的是 is_pressed 分支但 is_over 为假），
-                // 也就是 release 那一帧按钮算出来的矩形漂了出去。按下即触发绕开这一帧的不确定性，
-                // 而且与用户预期一致（点"确认"就是要立刻生效）。
+                // ★ 按下即触发（on_press_down），不等 release：
+                //   实测（2026-10-21）这个底栏按钮**按下能进、松开不触发** —— 按下的
+                //   `cursor.is_over(bounds)` 为真（rect 852,828.8,258x26.8），松开时同一位置
+                //   却判定为"不在按钮上"（事件仍被 Captured ⇒ 走的是 is_pressed 分支但 is_over 为假），
+                //   也就是 release 那一帧按钮算出来的矩形漂了出去。按下即触发绕开这一帧的不确定性，
+                //   而且与用户预期一致（点"确认"就是要立刻生效）。
                 .on_press_down(Message::Apply(id.clone())),
             )
             .push(
@@ -4276,14 +4956,22 @@ impl AppModel {
             )
             .spacing(spacing.space_xs);
 
-        let mut sc = widget::scrollable(col)
-            .id(panel_scroll_id())
-            .height(Length::Fill);
-        if self.panel_bottom {
-            // 截图用：从底部开（见 panel_bottom 字段的注释）
-            sc = sc.anchor_y(cosmic::iced::widget::scrollable::Anchor::End);
-        }
-        let body_inner: Element<'_, Message> = sc.into();
+        // 诊断开关（临时）：`WPHUB_NO_PANEL_SCROLL=1` ⇒ 面板不套 scrollable。
+        // 用来分辨"点不动"是 scrollable 的命中测试造成的，还是别的原因。
+        let no_panel_scroll =
+            std::env::var("WPHUB_NO_PANEL_SCROLL").ok().as_deref() == Some("1");
+        let body_inner: Element<'_, Message> = if no_panel_scroll {
+            widget::container(col).height(Length::Fill).into()
+        } else {
+            let mut sc = widget::scrollable(col)
+                .id(panel_scroll_id())
+                .height(Length::Fill);
+            if self.panel_bottom {
+                // 截图用：从底部开（见 panel_bottom 字段的注释）
+                sc = sc.anchor_y(cosmic::iced::widget::scrollable::Anchor::End);
+            }
+            sc.into()
+        };
 
         widget::container(
             widget::column::with_capacity(3)
@@ -4333,6 +5021,7 @@ impl AppModel {
     }
 
     /// **作者嵌入的宣传图**那一段（0 张 = `None`，整段不出）。
+    ///
     /// 遍历「该壁纸的图片引用清单」（`promo` 模块给的），**逐张**显示：
     /// 已经上屏的直接画；还在后台下的画占位（下载完成会来一条 `Message::PromoImage` 换成真图）。
     /// 一行的宽度是面板内容宽，图按自身比例缩进去（不超过 300 高）。
@@ -4469,7 +5158,7 @@ impl AppModel {
             }
         };
 
-        // 无图标：作者项
+        // ★ 无图标：作者项
         we_ui::prop_row(None, p.label.clone(), control)
     }
 
@@ -4505,6 +5194,7 @@ impl AppModel {
     }
 
     /// **引擎内置项**·播放速度：滑杆 0.25×~3.0×（默认 1.0×，步进 0.05）。
+    ///
     /// 内核侧是**新能力**：倍率只乘场景时间（视频壁纸的 `rate` 是另一条路，不在这里）。
     /// 拖动时每帧发一次 `TimeScaleSet`，出站队列按 key 合并 + 55 ms 节流（≈18 Hz）；
     /// `.on_release(SliderRelease)` 保证**松手必发终值**。
@@ -4522,6 +5212,7 @@ impl AppModel {
     }
 
     /// **引擎内置项**·场景音频音量：滑杆 0~100%（默认 100%）。
+    ///
     /// 内核调的是**它自己那条播放流**的音量（per-stream，`pactl set-sink-input-volume`），
     /// **不是**系统音量 —— 拖它不会动 PC 的音量条（用户 2026-10-22 的 bug）。
     /// 界面这里只保留最后一次的值，拖动中的显示不等回执。
@@ -4543,7 +5234,8 @@ impl AppModel {
     }
 
     /// **引擎内置项**·画面色彩第 `i` 项：滑块 + 右侧数值列（值域/步长和原来的 ± 按钮完全一致）。
-    /// 例外：**色相**（i=3）—— 用户 要求"所有选色的内容改成圆形的色盘"，
+    ///
+    /// 例外：**色相**（i=3）—— 用户 2026-10-18 要求"所有选色的内容改成圆形的色盘"，
     /// 色相是这六项里唯一"选色"的那一项 ⇒ 换成圆形色相盘（[`color_wheel::hue_wheel`]）。
     /// 输出仍是**弧度**、仍走 `Message::ColorSet(3, v)`（与滑条同一条落点，
     /// `color_bounds(3) = (-3.14, 3.14)` 不变）；其余五项是数值调整（亮度/对比/饱和/色温/伽马），
@@ -4619,12 +5311,10 @@ impl AppModel {
 
     /// 「您的预设」那一排：保存 / 加载 / 应用到所有壁纸 / 分享 JSON / 重置
     /// （参考图 7-4 底部：两个半宽 + 三个通栏，最后一个是红底通栏）。
-///
+    ///
     /// * **保存 / 加载**：本程序一条壁纸一个槽位（`presets.json`）—— 不做命名槽位、
-    /// 也没有文件对话框，这一点和 WE 不同（如实标出来）。
-///
+    ///   也没有文件对话框，这一点和 WE 不同（如实标出来）。
     /// * **应用到所有壁纸**：凡是「也有这个属性名、且类型对得上」的壁纸都会写上。
-///
     /// * **分享 JSON**：导出当前改动（复制到剪贴板）；**重置**：丢掉改动回到默认值并下发。
     fn view_presets<'a>(&'a self, id: &str, props: &[Prop]) -> Element<'a, Message> {
         let n = self.prop_edits.get(id).map(|m| m.len()).unwrap_or(0);
@@ -4682,8 +5372,9 @@ impl AppModel {
     }
 
     /// 颜色属性点开后展开的**圆形色盘**（hue 环 + 内部 S/V + 当前色预览 + 数值 + 圆形预设点）。
-    /// 统一走圆形色盘：原来那排 12 个**矩形**预设色块换成圆盘 + 圆形预设点。
-    /// 落点、消息、值格式一个都没变：
+    ///
+    /// 2026-10-18：用户要求「把所有选色的内容改成圆形的色盘」⇒ 原来那排 12 个
+    /// **矩形**预设色块换成圆盘 + 圆形预设点。落点、消息、值格式一个都没变：
     /// 拖动和点预设走的都是 `Message::PropColor(id, key, "r g b")`（→ `set_prop` → `set-prop`）。
     fn color_wheel_panel<'a>(&'a self, id: &str, p: &Prop) -> Element<'a, Message> {
         let value = self.prop_value(id, p);
@@ -4790,8 +5481,8 @@ impl AppModel {
                 }
                 bits.push(format!("内存 {:.0} MB", n.rss_mb));
                 bits.push(format!("{} 帧", n.frames));
-                // 把"两边看到的当前场景 id"都摆出来，便于一眼核对
-                // 内核在播的（权威） vs 界面记着的"上次应用"。不一致时一眼能看出。
+                // ★ 2026-10-15：把"两边看到的当前场景 id"都摆出来，便于一眼核对
+                //   —— 内核在播的（权威） vs 界面记着的"上次应用"。不一致时一眼能看出。
                 let kernel_id = self.playing_id().unwrap_or_else(|| {
                     if kernel_has_content(Some(n)) {
                         "（内核在播，不在本地列表）".to_string()
@@ -4819,11 +5510,12 @@ impl AppModel {
 }
 
 /// 连上内核时要不要把「上次应用」那条推给内核 —— **纯函数**，单测直接钉（见 `auto_apply_tests`）。
-/// 设计要点：
-/// · 内核里**已经在播**的那条是**权威** ⇒ 启动同步绝不把它换掉；
-/// · 只有内核**空闲**（没内容 / 没在播）时，才允许推进"上次应用"（否则会出现"重启内核后
-/// 桌面被换成 app 记得的那条"这种不可接受的副作用）；
-/// · 开关关掉 ⇒ **一个字也不推**。
+///
+/// 设计要点（用户明确要求）：
+///   · 内核里**已经在播**的那条是**权威** ⇒ 启动同步绝不把它换掉；
+///   · 只有内核**空闲**（没内容 / 没在播）时，才允许推进"上次应用"（否则会出现"重启内核后
+///     桌面被换成 app 记得的那条"这种不可接受的副作用）；
+///   · 开关关掉 ⇒ **一个字也不推**。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AutoApply {
     /// 开关关了（`--no-auto-apply` / 配置 `auto_apply_last=false`）⇒ 不推
@@ -4852,6 +5544,7 @@ pub fn decide_auto_apply(enabled: bool, kernel_busy: bool, has_last: bool) -> Au
 }
 
 /// 内核**有没有内容**（正在播某条壁纸）。
+///
 /// 判据只看 `kind` + `path`：内核**没内容**时自己报 `kind:"none"` 且 `path` 为空。
 /// **刻意不看 `playing`** —— 它会被"全屏窗口遮挡（`suppressed`）"和"用户暂停（`user_paused`）"
 /// 置成 false，而那两种情况下**内容还在**（用户暂停的正是那条壁纸）⇒ 那时也**不算**空闲、
@@ -4870,12 +5563,14 @@ fn color_value_text(i: usize, v: f32) -> String {
 }
 
 /// 发现页阶段二：后台并发下这一页的缩略图，**每下到一张就发一条 `Message::DiscoverThumb`**。
+///
 /// 为什么用流（`Task::stream`）而不是一次性 `Task::perform`：一次性的 `load_thumbs`
 /// 要等这一页全部下完才返回，界面那一下只能整批刷新（30 张全好之前一张都看不到）；
 /// 这里把**每张图一进后台就立刻**送回 UI ⇒ 界面是"一张一张补出来"的。
 /// 下载全在后台线程里跑（`load_thumbs_streaming`），UI 只收消息 ⇒ 全程可交互、滚动不卡。
 /// 全部结束后再发一条 `Message::DiscoverThumbsDone`（带统计）。
-/// `want = items.len` ⇒ 这一页**全部**都要（以前写死 24，第 25 张起永远没图）。
+///
+/// `want = items.len()` ⇒ 这一页**全部**都要（以前写死 24，第 25 张起永远没图）。
 fn discover_thumb_stream(
     items: Vec<workshop::Item>,
 ) -> impl cosmic::iced::futures::Stream<Item = Message> {
@@ -4917,6 +5612,7 @@ fn discover_thumb_stream(
 
 /// 宣传图的后台下载流：按顺序把还没缓存的远程图下回来，**每下到一张就发一条**
 /// `Message::PromoImage`，最后一条 `Message::PromoDone`。
+///
 /// 与发现页缩略图流同一套路：下载在线程里跑，UI 线程一字节都不碰。
 /// 顺序下（实测最多 7 张、单张 ≤ 680 KB），一张失败只跳过这一张。
 fn promo_stream(
@@ -4955,26 +5651,30 @@ fn promo_stream(
 }
 
 /// 16:9 缩略图的宽 / 高 —— 网格排布与 tile 共用一份（WE 的格子就是 16:9）。
+///
 /// 尺寸随右侧面板一起调过：面板从 380 加宽到 540 之后，格子必须相应收一点，
 /// 否则默认窗口（实测 1280 逻辑宽）下**放不下 4 列**。
 /// 168x95 = 1.77（≈16:9）；1280 宽窗口扣掉面板与留白后还能排 4 列（见 `tiles_per_row`）。
 /// 卡片尺寸三档 `(宽, 高)`（16:9 附近；逻辑像素）。
-/// 用户 第二轮：「三档**整体上移一级** —— 当前的大（280×158）当标准
+///
+/// 用户 2026-10-21 第二轮（U3）：「三档**整体上移一级** —— 当前的大（280×158）当标准，
 /// 再出一个更大的」。于是 小 220×124 / **中 280×158（默认）** / 大 360×203。
 /// 做成**三档而不是连续像素**是刻意的：缩略图是 CPU 预先降采样好的（见 [`thumb_from_bytes`]），
 /// 三档 ⇒ 每条壁纸最多 3 份缓存，拖动滑杆不会把解码/缩放风暴打到 UI 线程上。
 const CARD_SIZES: [(f32, f32); 3] = [(220.0, 124.0), (280.0, 158.0), (360.0, 203.0)];
-/// 默认档 = 中（280×158）= 上次的「大」，用户认定的标准尺寸。
+/// 默认档 = 中（280×158）= 上一轮的「大」，用户认定的标准尺寸。
 /// **硬编码而不是落盘**：重启后必须仍停在这一档（见 `AppModel::card_idx` 的初始化）。
 const CARD_DEFAULT: usize = 1;
-/// 格子之间的横向/纵向间距 —— 用户 「缩览图间距稍微大一点，现在太紧凑了」。
-/// 这是**真间距**（行/列的 `spacing`），不是靠给卡片加内边距充数；24 ≈ 上次 8 的 3 倍，
+/// 格子之间的横向/纵向间距 —— 用户 2026-10-21：「缩览图间距稍微大一点，现在太紧凑了」。
+///
+/// 这是**真间距**（行/列的 `spacing`），不是靠给卡片加内边距充数；24 ≈ 上一轮 8 的 3 倍，
 /// 量出来相邻两张卡片的缝隙就是 24 px（见 `layout_tests::tile_gap_is_measured_gap`）。
 const TILE_GAP: f32 = 24.0;
 /// 右侧详情/属性面板的宽度（加宽到 540 —— 落在要求的 520~560 区间内）
 const PANEL_W: f32 = 540.0;
 
 /// 详情面板顶部大预览图的**显示上限**（宽 / 高，逻辑像素）。
+///
 /// 用户反馈：「把右侧的缩览图缩小一些吧，不要搞这么大。图像都缩放模糊了，观感不好」——
 /// 数据源是工坊的 `preview.jpg/gif`，实测本机 17 条分辨率只有 180~1080 且多为**正方形**；
 /// 以前不管源图多大都拉满面板宽（≈520）、还按 16:9 覆盖裁剪，小图被放大 2~3 倍 ⇒ 糊。
@@ -4984,10 +5684,12 @@ const PREVIEW_MAX_W: f32 = 320.0;
 const PREVIEW_MAX_H: f32 = 400.0;
 
 /// **工坊条目详情图**（发现/工坊两页的右侧详情）的宽度上限。
-/// 用户 第二轮：「发现和工坊的详细页，缩览图给到最大 —— 这个页面空间比较空余，
+///
+/// 用户 2026-10-21 第二轮：「发现和工坊的详细页，缩览图给到最大 —— 这个页面空间比较空余，
 /// 不要给这么小」。那一档原来写死 320 宽 × 200 高，在 540 宽的面板里左右各空 100 px、
 /// 上面还压着一大片空白。现在：**宽度 = 面板内容区全宽**（540 - 2×内边距 = 520，上限 720
 /// 只在面板真被放宽时才起作用），高按 16:9 算 ⇒ 1400 宽窗口下量出来 520×292。
+///
 /// 不违反"绝不超过源图像素"那条：工坊缩略图实测 514~1079 px 见方（`~/.cache/wallpaper-hub/
 /// workshop/thumbs`），520 宽仍是**缩小**，且走的是同一套 Lanczos3 预缩放（上屏 1:1）。
 const DETAIL_PREVIEW_MAX_W: f32 = 720.0;
@@ -4996,6 +5698,7 @@ const DETAIL_PREVIEW_MAX_W: f32 = 720.0;
 const PANEL_PAD_X: f32 = 20.0;
 
 /// 详情面板里那张大预览的显示尺寸 `(宽, 高)` —— 纯函数，好单测。
+///
 /// 宽度 = 面板内容区宽度（夹在 160..[`DETAIL_PREVIEW_MAX_W`] 之间），高 = 宽 × 9/16
 /// （工坊缩略图都是方图，显示时按 16:9 居中裁剪；见 `thumb_from_bytes` 的 Cover 语义）。
 fn detail_preview_size(win_w: f32, card_w: f32) -> (f32, f32) {
@@ -5005,7 +5708,7 @@ fn detail_preview_size(win_w: f32, card_w: f32) -> (f32, f32) {
 }
 
 /// 面板之外还要扣掉的横向留白：窗口左右内边距 8×2 + 「左内容 ↔ 面板」之间的 8。
-/// 与 `view` 里的 `padding(spacing.space_s)` + `spacing(space_s)` 对应。
+/// 与 `view()` 里的 `padding(spacing.space_s)` + `spacing(space_s)` 对应。
 const CHROME_X: f32 = 24.0;
 
 /// 属性面板那个滚动区的 id（`--panel-scroll` 要按它把面板滚到指定位置）
@@ -5048,6 +5751,7 @@ const COLOR_PRESETS: [&str; 12] = [
 ];
 
 /// 右侧面板宽度：目标 `PANEL_W`（540，落在要求的 520~560 区间）。
+///
 /// 窗口很窄时**退让**（否则中间网格会被压成一列甚至压没）：保证左边至少还能放两列格子，
 /// 但不会小于 320（再小属性行的控件列就摆不下了）。900 宽（本程序的最小宽度）时 =
 /// 900 - 24 - (2×168+8) = 532，仍在 520~560 内。
@@ -5063,7 +5767,56 @@ fn tiles_per_row(win_w: f32, card_w: f32) -> usize {
     (((avail + TILE_GAP) / (card_w + TILE_GAP)).floor() as usize).clamp(1, 12)
 }
 
+/// 工坊筛选的**防抖判据**（纯函数，可单测）：这条定时消息该不该放行？
+///
+/// 只有"消息带来的代数 == 当前代数"才放行。用户每点一下就把当前代数 +1，
+/// 于是同一个 300ms 窗口里排下的 N 条定时器到点时，前 N-1 条的代数都已经过期 ⇒
+/// **只放行最后一条**（连点 5 次 = 1 次请求）。抽成函数是为了让这条判据能被断言，
+/// 而不是只能靠看日志。
+fn debounce_should_fire(msg_generation: u64, current_generation: u64) -> bool {
+    msg_generation == current_generation
+}
+
+/// 筛选防抖的**状态机**（app 里真正在用的那个，不是测试专用仿制品）：
+/// `bump()` 排在每次勾选后（返回本次的代数，定时消息带着它回来），
+/// `fire()` 在定时消息到点时调用 —— 只有代数仍是最新的才放行，并记一次 release。
+///
+/// 一次 release = 一次 `DiscoverRunSearch` = **一次** browse 请求（一页只发一条查询，
+/// 见 `wp::workshop::Filter::query`），所以"连点 5 次 → release 1 次"就等于"1 次请求"。
+#[derive(Debug, Default)]
+struct FilterDebounce {
+    generation: u64,
+    /// 真的放行过几次（连点验收盯这个数）
+    releases: usize,
+}
+
+impl FilterDebounce {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// 用户又改了一次筛选：代数 +1，返回这一代（定时消息要带上它）。
+    fn bump(&mut self) -> u64 {
+        self.generation = self.generation.wrapping_add(1);
+        self.generation
+    }
+
+    fn current(&self) -> u64 {
+        self.generation
+    }
+
+    /// 某一代定时消息到点：该放行吗？（放行才计一次 release）
+    fn fire(&mut self, msg_generation: u64) -> bool {
+        if !debounce_should_fire(msg_generation, self.generation) {
+            return false;
+        }
+        self.releases += 1;
+        true
+    }
+}
+
 /// 缩略图预缩放的缓存：`(来源键, 宽, 高) → 已缩好的 RGBA 句柄`。
+///
 /// 为什么要自己缩：iced 的 wgpu 图像 atlas 只有 `mip_level_count: 1`（无 mipmap），
 /// 把 1920×1080 直接画进 220×124 会掉采样 ⇒ 糊 + 锯齿。这里用 Lanczos3 在 CPU 上缩到
 /// **卡片正好那么大**，上屏就是 1:1 像素。三档卡片尺寸 ⇒ 最多 3 份缓存。
@@ -5106,6 +5859,7 @@ fn thumb_from_path(path: &str, w: u32, h: u32) -> widget::image::Handle {
 }
 
 /// 从**编码字节**取一张按 `w×h` 缩好的缩略图。
+///
 /// 语义 = `ContentFit::Cover`：先按目标比例**居中裁剪**，再 Lanczos3 缩到 `w×h`。
 /// 原图比卡片还小 ⇒ 不放大（保持原像素，交给 GPU 做一次线性放大 —— 放大糊是源图不够，
 /// 不是缩放算法的问题）。
@@ -5150,11 +5904,10 @@ fn workshop_url(id: &str) -> String {
 
 /// 「场景音频」滑杆的默认档：**100%**。
 ///
-/// 以前这里是"启动读一次系统默认 sink 的实际音量"（`pactl get-sink-volume`）—— 那是个
-/// 错误的口径：滑杆调的是**壁纸自己那条播放流**（per-stream，内核侧
-/// `pactl set-sink-input-volume`），跟系统音量条是两回事。拿系统音量当初值，等于让
-/// 壁纸的音量跟着 PC 的音量条跑，用户一拖又把 PC 的音量改了（2026-10-22 的 bug）。
-/// 默认档就该是"壁纸配乐满音量"，系统音量由系统自己管。
+/// 以前这里是"启动读一次系统默认 sink 的实际音量"（`pactl get-sink-volume`）—— 错的口径：
+/// 滑杆调的是**壁纸自己那条播放流**（per-stream，内核侧 `pactl set-sink-input-volume`），
+/// 跟系统音量条是两回事。拿系统音量当初值 = 让壁纸音量跟着 PC 音量跑，用户一拖又把
+/// PC 的音量改了（2026-10-22 的 bug）。默认档就是"壁纸配乐满音量"。
 const SCENE_VOLUME_DEFAULT: f32 = 100.0;
 
 /// 字节流里的图片尺寸 —— **只读文件头**（`into_dimensions`），不整张解码。
@@ -5177,13 +5930,12 @@ fn fit_into(w: f32, h: f32, max_w: f32, max_h: f32) -> (f32, f32) {
 }
 
 /// 详情面板顶部大预览图的**显示尺寸**（纯函数，可单测）。
+///
 /// 规则（按用户反馈「不要搞这么大，图像都缩放模糊了」定）：
-///
 /// 1. 不超过面板内容宽 `avail_w`；
-///
 /// 2. 不超过 `PREVIEW_MAX_W`（水平上限）/ `PREVIEW_MAX_H`（只对极端高图生效）；
-///
 /// 3. **绝不放大超过源图实际像素**：显示宽 ≤ 源图宽、显示高 ≤ 源图高（按源图自身比例）。
+///
 /// 于是：源图是 180×180 的小 GIF ⇒ 就显示 180×180（放大倍率 1.0，不糊）；
 /// 源图是 1080×1080 ⇒ 收到 320×320（缩小，清晰）；源图尺寸未知 ⇒ 上限内的 16:9 占位。
 fn preview_display_size(src_w: u32, src_h: u32, avail_w: f32) -> (f32, f32) {
@@ -5203,6 +5955,7 @@ fn preview_display_size(src_w: u32, src_h: u32, avail_w: f32) -> (f32, f32) {
 
 /// 在壁纸目录里找一张**像素比封面更多**的本地图（作者的高分辨率帧/作者图），
 /// 返回 `(路径, (宽,高))`。找不到就 `None`（界面就退回用封面）。
+///
 /// 只扫**一层**（非递归）、只看常见光栅扩展名、最多看 64 个文件；判据是纯像素面积，
 /// 不看文件名。本机实测 17 条工坊内容目录里**只有 `preview.*`**（其余都在 `scene.pkg` 里），
 /// 所以这条基本走 None —— 有更大的图时才会真的换（以及相应的单测覆盖）。
@@ -5273,6 +6026,7 @@ enum PropKind {
 }
 
 /// 作者属性在面板上的呈现形态 —— **只看「类型 + text 的内容 + value」**，不看属性名：
+///
 /// WE 的作者把 `general.properties` 当**排版区**用：`type:"text"` 里塞 `<img>`、`<h3>`、
 /// 空串。以前这里一律渲染成「标签 + 可编辑输入框」，用户看到一堆没意义的键与输入框。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5295,6 +6049,7 @@ enum PropForm {
 }
 
 /// 解析一份 `general.properties`。
+///
 /// 规则只有一条：**foreach 每一条**，按它自己的 `type` 决定控件；名字只当显示文本
 /// （`text` 字段），绝不参与判断；`text` 是不是「控件标签」由 `classify_prop` 看数据定
 /// （排版块/图片/空串/本地化键都不出控件）。顺序按 `index` / `order`，
@@ -5370,32 +6125,28 @@ fn parse_props(schema: &str) -> Vec<Prop> {
 /// 不看属性名、不看壁纸名、不按 `key` 白名单。规则（每一条都有本机真实数据兜底）：
 ///
 /// 1. `text` 为空（trim 后）⇒ `Blank` 跳过。
-/// *实测* `2887537617` 的 `xian` / `xinzeng2,3,4,5,9`、`3704273480` 的 `kong1/2/4`：
-/// `type:"text"` 而 `text:""` —— 作者拿它占位。
-///
+///    *实测* `2887537617` 的 `xian` / `xinzeng2,3,4,5,9`、`3704273480` 的 `kong1/2/4`：
+///    `type:"text"` 而 `text:""` —— 作者拿它占位。
 /// 2. `text` 是 `ui_*` 本地化键（如 `ui_browse_properties_scheme_color`）⇒ `LocalizedKey` 跳过
-/// （没有翻译表就只剩键名，**别把键名当标签**）。
-/// ⚠ **例外**：`type:"color"` 且 `value` 是**可解析颜色** ⇒ 留作可编辑**色盘**
-/// （键名经 `pretty_label` 美化后当标签）。判据仍然只看数据：`type` + `value` 的形状
-/// + `text` 的形态，**不看 `key`/属性名/壁纸名**。
-/// 以前整行跳过 ⇒ 作者那排"配色/主题色"色盘在面板里**根本看不到**（本机
-/// `2887537617` / `3704273480` / `2564205376` / `2823687015` 的 `schemecolor` 都是这种）。
-/// 图片型/排版型 `text` **不享受**这个例外（它们走下面 3 / 4 两条，照旧只读/归宣传图）。
-///
+///    （没有翻译表就只剩键名，**别把键名当标签**）。
+///    ⚠ **例外（2026-10-14）**：`type:"color"` 且 `value` 是**可解析颜色** ⇒ 留作可编辑**色盘**
+///    （键名经 `pretty_label` 美化后当标签）。判据仍然只看数据：`type` + `value` 的形状
+///    + `text` 的形态，**不看 `key`/属性名/壁纸名**。
+///    以前整行跳过 ⇒ 作者那排"配色/主题色"色盘在面板里**根本看不到**（本机
+///    `2887537617` / `3704273480` / `2564205376` / `2823687015` 的 `schemecolor` 都是这种）。
+///    图片型/排版型 `text` **不享受**这个例外（它们走下面 3 / 4 两条，照旧只读/归宣传图）。
 /// 3. `text` 里有图片引用、去掉标记后没有文字 ⇒ `MediaOnly`。
-/// 这类图 `promo` 模块已经在「宣传图」段画出来了（遍历每条属性的 text），这里不再出行。
-///
+///    这类图 `promo` 模块已经在「宣传图」段画出来了（遍历每条属性的 text），这里不再出行。
 /// 4. `text` 是**排版块**（块级标记：`<h1..h6>` / `<div>` / `<p>` / `<center>` / `<br>` /
-/// `[center]` / `[hr]` …，或带换行）⇒ 不是控件标签：
-/// 去掉标记还有文字 ⇒ `Heading`（作者的**分组标题/横幅**，只读、加粗带线）；
-/// 没有文字 ⇒ `MediaOnly` / `Blank`（按有没有图）。
-/// 只有**行内**标记（`<b>` / `[b]` / `[i]` 这种包着标签文字的）才当标签看。
-///
+///    `[center]` / `[hr]` …，或带换行）⇒ 不是控件标签：
+///    - 去掉标记还有文字 ⇒ `Heading`（作者的**分组标题/横幅**，只读、加粗带线）；
+///    - 没有文字 ⇒ `MediaOnly` / `Blank`（按有没有图）。
+///    只有**行内**标记（`<b>` / `[b]` / `[i]` 这种包着标签文字的）才当标签看。
 /// 5. 剩下的就是「干净标签 + 作者真给用户编辑的类型」：
-/// `bool` / `slider` / `color` / `combo` / `textinput` ⇒ `Editable`（照旧出控件）；
-/// `text` 类型要看 `value`：只有**用户真填过字符串**（非空字符串，不是 `false`/`null`）
-/// 才当输入框（实测 `3704273480` 的 `key="text"` 就是 `type:"textinput"`、
-/// `value:"mouse pad"`）；否则没有可编辑语义 ⇒ `ReadOnlyNote`（只读一行，不出输入框）。
+///    - `bool` / `slider` / `color` / `combo` / `textinput` ⇒ `Editable`（照旧出控件）；
+///    - `text` 类型要看 `value`：只有**用户真填过字符串**（非空字符串，不是 `false`/`null`）
+///      才当输入框（实测 `3704273480` 的 `key="text"` 就是 `type:"textinput"`、
+///      `value:"mouse pad"`）；否则没有可编辑语义 ⇒ `ReadOnlyNote`（只读一行，不出输入框）。
 fn classify_prop(type_str: &str, text: &str, value: &serde_json::Value) -> PropForm {
     let raw = text.trim();
     let plain = strip_markup(raw);
@@ -5453,27 +6204,30 @@ fn kind_of(type_str: &str) -> PropKind {
 }
 
 // ── 「依赖显示」条件（`project.json` 的 `condition` 字段）──────────────────
+//
 // 数据事实（本机 17 条工坊工程；属性字段全集只有
 // `{order,text,type,value,fraction,max,min,precision,step,condition,index,options}`）：
 // `condition` 只有三种形态 ——
-// ① **缺席**（多数，如 `2887537617` 的 23 条全没有）⇒ 恒显示；
-// ② **指向兄弟属性的表达式**，实测两例：`2823687015` 的 `_12hmode` = `clock.value == true`、
-// `3704273480` 的 `text` / `text5` / `newproperty1` = `newproperty.value == 2`；
-// 语义是「**依赖显示**」（条件成立这一行才该出现），不是互斥/单选；
-// ③ 作者手填的任意串：`2564205376` 的 `"true"`、`2481886649` 的 `"Water Flow"`、
-// `2482408967` 的空串。
+//   ① **缺席**（多数，如 `2887537617` 的 23 条全没有）⇒ 恒显示；
+//   ② **指向兄弟属性的表达式**，实测两例：`2823687015` 的 `_12hmode` = `clock.value == true`、
+//      `3704273480` 的 `text` / `text5` / `newproperty1` = `newproperty.value == 2`；
+//      语义是「**依赖显示**」（条件成立这一行才该出现），不是互斥/单选；
+//   ③ 作者手填的任意串：`2564205376` 的 `"true"`、`2481886649` 的 `"Water Flow"`、
+//      `2482408967` 的空串。
+//
 // **[策略] 解析不了的一律「恒显示」**（fail-open）。依据三条：
-// 1. 形态①（缺席）与空串在数据里就等于「没有条件」⇒ 解析不了不该比没写显示得更少；
-// 2. 本程序**不实现任意表达式求值器**（那要一个 JS 解释器，超出范围）。能**确证**的只有
-// `<属性key>.value <op> <单个字面量>` 这种**单操作数**形状；右操作数必须是一个不带空白的
-// 单 token（引号包着的串除外），像 `a.value == 1 && b.value == 2` 这种复合式一律不猜；
-// 3. 代价不对称：**错隐**会让用户**再也拿不到**作者给的控件（面板里无处可点），**错显**只是
-// 多一行。⇒ 只有「能解析 + 引用得到那个兄弟属性 + 比较为假」才隐藏。
+//   1. 形态①（缺席）与空串在数据里就等于「没有条件」⇒ 解析不了不该比没写显示得更少；
+//   2. 本程序**不实现任意表达式求值器**（那要一个 JS 解释器，超出范围）。能**确证**的只有
+//      `<属性key>.value <op> <单个字面量>` 这种**单操作数**形状；右操作数必须是一个不带空白的
+//      单 token（引号包着的串除外），像 `a.value == 1 && b.value == 2` 这种复合式一律不猜；
+//   3. 代价不对称：**错隐**会让用户**再也拿不到**作者给的控件（面板里无处可点），**错显**只是
+//      多一行。⇒ 只有「能解析 + 引用得到那个兄弟属性 + 比较为假」才隐藏。
+//
 // **[策略] 条件不成立时仍然照常下发该属性**（只是这一行不画）。依据：`condition` 管的是
-// **编辑器里这一行显不显示**，不是这个值生不生效；`prop_edits` / `prop_overrides.json` 与
-// 内核 `set-prop` 都不看条件。若「不满足就不下发」，用户把下拉改回去时那一行会带着旧值重现、
-// 而屏幕上是内核的默认值 —— 界面与屏幕就不一致了（本程序最忌讳这个）。
-// ⇒ 门控**只发生在视图层**（`view_detail`），落盘与下发链路一行没动。
+//   **编辑器里这一行显不显示**，不是这个值生不生效；`prop_edits` / `prop_overrides.json` 与
+//   内核 `set-prop` 都不看条件。若「不满足就不下发」，用户把下拉改回去时那一行会带着旧值重现、
+//   而屏幕上是内核的默认值 —— 界面与屏幕就不一致了（本程序最忌讳这个）。
+//   ⇒ 门控**只发生在视图层**（`view_detail`），落盘与下发链路一行没动。
 
 /// 一条属性的「依赖显示」条件（来自 `condition` 字段）
 #[derive(Debug, Clone, PartialEq)]
@@ -5603,6 +6357,7 @@ fn cond_holds(cond: &PropCond, value_of: &dyn Fn(&str) -> Option<serde_json::Val
 }
 
 /// 条件里的等值比较：`<兄弟属性的值>` vs `<字面量>`。
+///
 /// **类型不严格**是必须的、不是放松：同一件事在数据里两种写法都有 ——
 /// `3704273480` 的 combo `newproperty` **默认值**是字符串 `"1"`（`options` 的 value 也是字符串），
 /// 而用户在下拉里选过之后写回覆盖表的是**数字**（`Message::PropCombo` → `combo_value_json`）
@@ -5647,6 +6402,7 @@ fn user_text_value(value: &serde_json::Value) -> bool {
 }
 
 /// `value` 是不是「可解析的颜色」—— WE 的 color 属性两种写法都认（`"1 0.5 0"` 与 `[1, 0.5, 0]`）。
+///
 /// 纯**形状**判据：字符串按空白切出 ≥3 个能解析的浮点，或数组前三个元素都是数字。
 /// 不比对任何具体值、不看属性名 —— 这就是 `classify_prop` 用来判断"这个是能用的色盘"的依据。
 fn is_parseable_color(value: &serde_json::Value) -> bool {
@@ -5670,6 +6426,7 @@ fn is_loc_key(text: &str) -> bool {
 }
 
 /// `text` 里有没有**排版级**标记（块级标签 / 换行 / 内联样式块）。
+///
 /// 判据：出现块级标签或 `<br>` / 换行 ⇒ 这段 text 是「排版块」而不是控件标签。
 /// 只列标签名，不做内容匹配 —— 换任何属性名、任何作者都成立。
 fn is_layout_markup(text: &str) -> bool {
@@ -5797,7 +6554,7 @@ fn data_dir() -> std::path::PathBuf {
             return std::path::PathBuf::from(d);
         }
     }
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/home/dev".into());
     std::path::PathBuf::from(home).join(".local/share/wallpaper-hub")
 }
 
@@ -5813,12 +6570,13 @@ fn load_overrides() -> HashMap<String, HashMap<String, serde_json::Value>> {
         .unwrap_or_default()
 }
 
-// ── 逐场景性能表：帧率────────────────────────────────────────
+// ── 逐场景性能表：帧率（2026-10-14）────────────────────────────────────────
+//
 // 就放在 `prop_overrides.json` 旁边（同一个数据目录）：壁纸 id → fps。
 // 表里有记录 = "用户给这条场景钉的值"；没有 = **自适应档**（默认 60，实测不够自动降 30）。
 // 刻意**不塞进 cosmic-config**：它是"按内容（场景）记的事实"，与 prop_overrides / presets 同类，
 // 一起放数据目录便于随数据迁移，也让"哪条场景钉过 30"一眼可见（老的那个全局 `fps` 键
-// 从本次起不再读写，见 `Config` 的注释）。
+// 从本轮起不再读写，见 `Config` 的注释）。
 
 fn scene_fps_path() -> std::path::PathBuf {
     data_dir().join("scene_fps.json")
@@ -5846,13 +6604,14 @@ fn save_scene_fps(map: &BTreeMap<String, u64>) {
 }
 
 /// 旧配置里那个全局 `fps` 键的值（cosmic-config 每个字段一个文件：`…/cosmic/<app_id>/v1/fps`）。
+///
 /// **只用来在启动时说一句**"老值不再生效"，绝不拿它做任何决定 —— 帧率已经逐场景了。
 /// 读不到 / 解析不出就是 `None`（新装机器、或用户从没设过）。
 fn legacy_global_fps(app_id: &str) -> Option<u64> {
     let base = std::env::var("XDG_CONFIG_HOME")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| {
-            let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+            let home = std::env::var("HOME").unwrap_or_else(|_| "/home/dev".into());
             std::path::PathBuf::from(home).join(".config")
         });
     let p = base.join("cosmic").join(app_id).join("v1").join("fps");
@@ -5873,6 +6632,7 @@ fn save_overrides(map: &HashMap<String, HashMap<String, serde_json::Value>>) {
 }
 
 // ── 「您的预设」：一条壁纸一个槽位（当前改动整套存下 / 整套读回）────────────
+//
 // WE 的 7-4 里是「加载 / 保存 / 应用到所有壁纸 / 分享 JSON / 重置」五连。
 // 本程序的「加载 / 保存」不做命名槽位、也没有文件对话框（那要 rfd + 一套列表 UI），
 // **一条壁纸一个槽位**：保存 = 把这套改动整套记下，加载 = 整套读回来逐条下发。
@@ -5901,6 +6661,7 @@ fn save_presets(map: &HashMap<String, HashMap<String, serde_json::Value>>) {
 }
 
 /// 属性的 JSON 值是否**配得上** schema 里那个 `type`。
+///
 /// 「应用到所有壁纸」只按「键名相同 + 类型对得上」写过去：同名不同类的键
 /// （比如这条是 bool 那条是 slider）不硬塞，免得把别人的属性写成垃圾。
 fn json_fits_kind(v: &serde_json::Value, kind: PropKind) -> bool {
@@ -5975,6 +6736,7 @@ fn param_row<'a>(label: &'a str, control: Element<'a, Message>) -> Element<'a, M
 }
 
 /// 音频「分析输出源」列表里"这一项是不是当前生效的那一路"（纯函数，可单测）。
+///
 /// `default` 那一项在 `cur` 为空 **或** 就是 `default` 时选中（内核没报时按"跟随系统"算）；
 /// 其余项按 sink 节点名**精确**比（和内核 `plan_sink` 的名字匹配口径一致，不做前缀/子串匹配）。
 fn sink_option_selected(cur: &str, value: &str) -> bool {
@@ -6026,7 +6788,7 @@ fn color_summary(c: &[f32; 6]) -> String {
 }
 
 /// 只有"自动档"才自适应：**逐场景表里有记录**（用户按这条场景钉过 30/60、或手选过）⇒ 一个字都不动。
-/// 纯函数 ⇒ 单测直接钉"用户的选择不被自适应打扰"（含本次的新判据）。
+/// 纯函数 ⇒ 单测直接钉"用户的选择不被自适应打扰"（含本轮的新判据）。
 fn adaptive_armed(table: &BTreeMap<String, u64>, id: Option<&str>) -> bool {
     let (fps, src) = config::fps_for_scene(table, id);
     src == config::FpsSource::Default && fps == config::SCENE_FPS_DEFAULT
@@ -6075,9 +6837,10 @@ fn gpu_busy_percent() -> Option<f64> {
 /// 下发时 fps 的最终判定（纯函数 → 单测直接钉"不静默覆盖"）。
 ///
 /// * `force` 是"用户刚按的 / 自适应刚定的" ⇒ 就用它，日志写`用户选择` / `自适应`；
-///
 /// * 否则按**逐场景表**算：有记录 = `逐场景表`，没记录 = `默认`（[`config::SCENE_FPS_DEFAULT`]）。
+///
 /// **无论哪条路，都不可能凭空变成"固定 30"** —— 只有"表里给这条记过 30"或"用户刚选 30"
+/// 才会是 30。这就是 2026-10-14 那个病根（每次应用都下发固定 30）在类型层面的封堵点。
 fn resolve_fps(
     table: &BTreeMap<String, u64>,
     id: Option<&str>,
@@ -6546,6 +7309,7 @@ mod layout_tests {
     use super::*;
 
     /// 面板宽度：**目标 540**（落在要求的 520~560 区间），窗口窄了才退让。
+    ///
     /// 左边界随**卡片档**走（`card_w × 2 + TILE_GAP`）—— 卡片放大后窄窗口要早点退让。
     #[test]
     fn panel_width_targets_540_and_yields_only_when_narrow() {
@@ -6567,6 +7331,41 @@ mod layout_tests {
         assert_eq!(panel_width(900.0, mid), 320.0);
         // 小档（220）在 900 宽窗口里退让到 412 —— 900 - 24 - (2×220+24)
         assert_eq!(panel_width(900.0, CARD_SIZES[0].0), 412.0);
+    }
+
+    /// 防抖：**连点 5 次只放行 1 次** —— 用的是 app 里**真正在跑**的那个状态机
+    /// （`FilterDebounce`：`arm_filter_debounce` 调 `bump()`，定时消息到点调 `fire()`），
+    /// 不是测试里另写一份仿制品。一次放行 = 一次 `DiscoverRunSearch` = 一条 browse 请求
+    /// （一页只发一条查询），所以"5 次点击 → 1 次请求"在这是可断言的。
+    #[test]
+    fn debounce_fires_once_for_a_burst_of_five_clicks() {
+        let mut d = FilterDebounce::new();
+        // 5 次连点：每次都排一条"带我这个代数"的 300ms 定时消息
+        let timers: Vec<u64> = (0..5).map(|_| d.bump()).collect();
+        // 到点（全在同一个窗口里先后回来）：只有最后一条的代数还是当前的
+        let fired: Vec<bool> = timers.iter().map(|g| d.fire(*g)).collect();
+        assert_eq!(
+            fired.iter().filter(|f| **f).count(),
+            1,
+            "5 次点击只能放行 1 次：{fired:?}"
+        );
+        assert_eq!(d.releases, 1, "放行计数 = 1（界面/日志就盯这个数）");
+        assert!(d.fire(timers[4]), "同一代再回来仍然放行（同窗口只会有一次）");
+        assert_eq!(d.releases, 2);
+
+        // 隔开够久的两次点击 ⇒ 各放行一次（不同窗口，互不作废）
+        let mut d = FilterDebounce::new();
+        let first = d.bump();
+        assert!(d.fire(first), "安静期后第一拍应该放行");
+        let second = d.bump();
+        assert!(!d.fire(first), "老的一拍不许再放行");
+        assert!(d.fire(second));
+        assert_eq!(d.releases, 2);
+
+        // 边角：还没点过 / 代数 0 —— 放行（第一次进页面本来就该搜一次）
+        let mut d = FilterDebounce::new();
+        assert_eq!(d.current(), 0);
+        assert!(d.fire(0));
     }
 
     /// 列数 = floor((可用宽 + 间距) / (卡片宽 + 间距))：**随窗口宽与卡片档一起变**。
@@ -6608,11 +7407,11 @@ mod layout_tests {
         }
     }
 
-    /// 卡片默认档 = 中（**280×158**）：用户 第二轮「当前的大（280×158）当标准」。
+    /// 卡片默认档 = 中（**280×158**）：用户 2026-10-21 第二轮「当前的大（280×158）当标准」。
     #[test]
     fn default_card_is_280x158() {
         assert_eq!(CARD_SIZES[CARD_DEFAULT], (280.0, 158.0));
-        // 三档整体上移一级：小 = 上次的中（220×124），大 = 新出的 360×203
+        // 三档整体上移一级：小 = 上一轮的中（220×124），大 = 新出的 360×203
         assert_eq!(CARD_SIZES[0], (220.0, 124.0));
         assert_eq!(CARD_SIZES[2], (360.0, 203.0));
         // 三档递增（滑杆从左到右 = 小→大）
@@ -6624,8 +7423,8 @@ mod layout_tests {
         }
     }
 
-    /// 卡片间距 = **真 spacing**（不是给卡片加内边距），至少 20 px：
-    /// 再小相邻卡片就糊成一片，看不出是两条独立壁纸。
+    /// 卡片间距 = **真 spacing**，且够大：用户要求"稍微大一点"⇒ 至少 20 px
+    /// （截图里量的相邻卡片缝隙就是它，见 `artifacts/u3-*/gap_measure.txt`）。
     #[test]
     fn tile_gap_is_a_real_spacing_of_at_least_20px() {
         assert!(
@@ -6635,6 +7434,7 @@ mod layout_tests {
     }
 
     /// 发现/工坊详情页的大图 = **面板内容区全宽**，1400 宽窗口下 ≥ 500 px，且高按 16:9。
+    /// （已安装壁纸的详情页不走这个函数，仍是 `PREVIEW_MAX_W` 那套，按用户要求不改。）
     #[test]
     fn workshop_detail_preview_is_the_panel_width_and_at_least_500() {
         let mid = CARD_SIZES[CARD_DEFAULT].0;
@@ -6692,25 +7492,14 @@ mod layout_tests {
         assert_eq!(a, b, "同参数必须命中缓存");
     }
 
-    /// 场景音频滑杆的默认档 = **100%**，且**不再**去读系统 sink 的音量（那会把 PC 音量拖进来）。
-    /// 用户 2026-10-22：「为什么软件调整声音后，PC 音量变了？」—— 口径必须是 per-stream，
-    /// 初值不能从 `pactl get-sink-volume` 抄。
+    /// 场景音频滑杆默认 = **100%**，且**不再**去读系统 sink 的音量（那会把 PC 音量拖进来）。
+    /// 用户 2026-10-22：「为什么软件调整声音后，PC 音量变了？」
     #[test]
     fn scene_volume_defaults_to_full_and_never_reads_the_sink() {
         assert_eq!(SCENE_VOLUME_DEFAULT, 100.0);
-        // 滑杆显示用同一个常量（`None` 都不该出现：默认档有确定的值）
-        let shown = match Some(SCENE_VOLUME_DEFAULT) {
-            Some(v) => format!("{v:.0}%"),
-            None => "100%".to_string(),
-        };
-        assert_eq!(shown, "100%");
-        // 源码层面钉死：界面**不许**再去问系统音量（`get-sink-volume` 一个都不许有）。
-        // 只看测试模块**之前**的代码行（这条断言自己就写着这两个词）。
+        // 源码层面钉死：界面**不许**再问系统音量（只看测试模块之前的代码行 —— 这条断言自己就写着那两个词）
         let src = include_str!("app.rs");
-        let code = src
-            .split("mod layout_tests {")
-            .next()
-            .unwrap_or("");
+        let code = src.split("mod tests {").next().unwrap_or("");
         let mut hits = Vec::new();
         for (i, line) in code.lines().enumerate() {
             let t = line.trim_start();
@@ -6822,7 +7611,7 @@ mod perf_msg_tests {
         assert!(perf_msg_from_name("nonsense").is_none());
     }
 
-    /// **不静默覆盖**：下发时那一个 fps 只可能来自
+    /// ★ **不静默覆盖**（2026-10-14 的病根）：下发时那一个 fps 只可能来自
     /// ①逐场景表 ②用户刚按的 ③自适应刚定的 —— 空表 + 没有 force 时**必须是新默认 60**，
     /// 而且日志里的"来源"要如实写出来。这条测试是那个bug的回归网。
     #[test]
@@ -6851,7 +7640,7 @@ mod perf_msg_tests {
         assert_eq!(config::FpsSource::SceneTable.label(), "逐场景表");
     }
 
-    /// 用户钉过 / 手选过的场景，自适应**一个字都不动**（本次改了判据之后也必须保持）：
+    /// ★ 用户钉过 / 手选过的场景，自适应**一个字都不动**（本轮改了判据之后也必须保持）：
     /// 事故当时就是靠 `scene_fps.json = {"2564205376":60,"3571777169":30}` 临时按住的。
     #[test]
     fn pinned_scene_is_never_touched_by_the_new_judgement() {
@@ -6905,14 +7694,14 @@ mod auto_apply_tests {
         }
     }
 
-    /// ① **内核有在播 ⇒ 绝不换掉它**（这就是本次要修的真实困扰：重启内核后桌面被换成
-    /// app"上次应用"那条）。即使手上确实记着一条"上次应用"，判定也必须是 `KernelBusy`。
+    /// ① **内核有在播 ⇒ 绝不换掉它**（这就是本轮要修的真实困扰：重启内核后桌面被换成
+    ///    app"上次应用"那条）。即使手上确实记着一条"上次应用"，判定也必须是 `KernelBusy`。
     #[test]
     fn kernel_busy_is_authoritative_so_last_applied_is_never_pushed() {
         // 内核在播 X-Ray 2564205376；app 记得"上次应用"= 1931934283（两者不同）
         let playing = st(
             "scene",
-            "/home/user/.local/share/Steam/steamapps/workshop/content/431960/2564205376",
+            "/home/dev/.local/share/Steam/steamapps/workshop/content/431960/2564205376",
             true,
             false,
             false,
@@ -6964,7 +7753,7 @@ mod auto_apply_tests {
     }
 
     /// ④ **"用户暂停"与"全屏遮挡"都还算是内容**：内核没在画（`playing=false`）但那条壁纸
-    /// 还在 ⇒ 也**不算空闲**、不许被"上次应用"换掉。（判据刻意不看 `playing`。）
+    ///    还在 ⇒ 也**不算空闲**、不许被"上次应用"换掉。（判据刻意不看 `playing`。）
     #[test]
     fn paused_or_suppressed_wallpaper_still_counts_as_content() {
         let paused = st("scene", "/x/scene.pkg", false, true, false);
@@ -6977,10 +7766,10 @@ mod auto_apply_tests {
     }
 
     /// ⑤ 从**真·内核 status 行**（内核自己那套格式）解析出来也要判对 —— 避免"只在手造
-    /// 结构体上成立、换个字段名就漂"。
+    ///    结构体上成立、换个字段名就漂"。
     #[test]
     fn parses_real_kernel_status_lines() {
-        let playing = r#"{"ok":true,"kind":"scene","path":"/home/user/.local/share/Steam/steamapps/workshop/content/431960/2564205376","playing":true,"suppressed":false,"user_paused":false,"frames":1234,"fps":60}"#;
+        let playing = r#"{"ok":true,"kind":"scene","path":"/home/dev/.local/share/Steam/steamapps/workshop/content/431960/2564205376","playing":true,"suppressed":false,"user_paused":false,"frames":1234,"fps":60}"#;
         let s = native::Status::parse(playing).expect("ok:true 要能解析");
         assert!(kernel_has_content(Some(&s)), "内核报了 scene + path ⇒ 有内容");
 
@@ -6990,7 +7779,7 @@ mod auto_apply_tests {
     }
 
     /// ⑥ 默认是"不乱换"：持久配置里 `auto_apply_last` 默认 `true`（允许在内核空闲时补一条），
-    /// 而**内核在播时**仍然判成 `KernelBusy`（不动作）。
+    ///    而**内核在播时**仍然判成 `KernelBusy`（不动作）。
     #[test]
     fn config_default_is_do_not_swap() {
         let cfg = config::Config::default();
@@ -7007,7 +7796,8 @@ mod auto_apply_tests {
 mod color_slot_tests {
     use super::*;
 
-    /// **的 bug**：调色的落点 —— **没有选中的壁纸 ⇒ 一个字也不写**。
+    /// **2026-10-14 的 bug**：调色的落点 —— **没有选中的壁纸 ⇒ 一个字也不写**。
+    ///
     /// 以前无选中时会把值写进**全局** `color`（`Config::color`，只是老配置的迁移默认值）
     /// ⇒ 所有"还没记过槽"的壁纸一起被改掉，把"色彩按壁纸 id 分槽"的设计打穿。
     /// 真实触发路径是 `--perf-msg color-reset`（性能自检在界面选中任何壁纸之前就按了那个按钮）。
@@ -7060,7 +7850,7 @@ mod color_slot_tests {
         assert!(cfg.color_by_id.get("A").is_none(), "中性值等于没有覆盖");
 
         // ④ 连按几次"没选中时的颜色键"（`--perf-msg color-reset` / `bright+` 那条路）：
-        // 全局值、分槽表都原封不动
+        //    全局值、分槽表都原封不动
         let before = cfg.color.clone();
         for c in [
             [1.0f32, 1.0, 1.0, 0.0, 0.0, 1.0],
@@ -7073,7 +7863,7 @@ mod color_slot_tests {
     }
 
     /// `--perf-msg` 里那批色彩名字确实映射到走 `set_color` 的 Message
-    /// （`color-reset` 就是 报上来的那条路径）。
+    /// （`color-reset` 就是 2026-10-14 报上来的那条路径）。
     #[test]
     fn perf_color_names_go_through_set_color() {
         assert!(matches!(
@@ -7167,7 +7957,7 @@ mod prop_tests {
         let props = parse_props(schema);
         assert_eq!(props[0].options[0], ("x".to_string(), "x".to_string()));
         assert_eq!(props[1].label, "scheme color", "本地化键要美化成人话");
-        // 本地化键 + color ⇒ 仍然是**可编辑色盘**；本地化键 + bool ⇒ 跳过
+        // 本地化键 + color ⇒ 仍然是**可编辑色盘**（2026-10-14）；本地化键 + bool ⇒ 跳过
         assert_eq!(props[1].form, PropForm::Editable(PropKind::Color));
         assert_eq!(props[2].form, PropForm::LocalizedKey);
     }
@@ -7256,13 +8046,13 @@ mod prop_tests {
         assert_eq!(f("text", "", j("false")), PropForm::Blank);
         assert_eq!(f("text", "   ", j("false")), PropForm::Blank);
         // 2) 本地化键 ⇒ 跳过（键名不当标签）
-        // ⚠ 例外：**真·颜色控件**（type=color + 可解析颜色）留作可编辑色盘
+        //    ⚠ 例外：**真·颜色控件**（type=color + 可解析颜色）留作可编辑色盘（2026-10-14）
         assert_eq!(
             f("color", "ui_browse_properties_scheme_color", j("0 0 0")),
             PropForm::Editable(PropKind::Color),
             "本地化键挂在真颜色控件上 ⇒ 保留成色盘（整行跳过的话用户看不到它）"
         );
-        // 判据只看数据：换个键名、换个可解析颜色写法，结论一样
+        //    判据只看数据：换个键名、换个可解析颜色写法，结论一样
         assert_eq!(
             f("color", "ui_properties_whatever_scheme", j("0.1 0.2 0.3")),
             PropForm::Editable(PropKind::Color)
@@ -7272,7 +8062,7 @@ mod prop_tests {
             PropForm::Editable(PropKind::Color),
             "数组写法的颜色同样认"
         );
-        // 不是 color 类型 / 值不成形状 ⇒ 照旧跳过（不许把任意本地化键都变成控件）
+        //    不是 color 类型 / 值不成形状 ⇒ 照旧跳过（不许把任意本地化键都变成控件）
         assert_eq!(
             f("bool", "ui_browse_properties_scheme_color", j("0 0 0")),
             PropForm::LocalizedKey
@@ -7286,7 +8076,7 @@ mod prop_tests {
             f("color", "ui_browse_properties_scheme_color", serde_json::json!(true)),
             PropForm::LocalizedKey
         );
-        // HTML/图片型 text 不享受这个例外：图片型仍归「宣传图」段（只读展示）
+        //    HTML/图片型 text 不享受这个例外：图片型仍归「宣传图」段（只读展示）
         assert_eq!(
             f(
                 "color",
@@ -7390,8 +8180,8 @@ mod prop_tests {
 
             if id == "2887537617" {
                 // 23 条里 9 条是真控件（4 bool + 2 slider + 2 color + **1 个本地化键色盘**）
-                // `schemecolor`（`type=color` + `text=ui_browse_properties_scheme_color`）
-                // 以前整行跳过 ⇒ 用户看不到那个色盘；现在保留成可编辑色盘 ⇒ 可编辑 8→9、本地化键跳过 1→0
+                // ★ 2026-10-14：`schemecolor`（`type=color` + `text=ui_browse_properties_scheme_color`）
+                //   以前整行跳过 ⇒ 用户看不到那个色盘；现在保留成可编辑色盘 ⇒ 可编辑 8→9、本地化键跳过 1→0
                 assert_eq!(
                     (editable, heading, media, blank, loc),
                     (9, 1, 7, 6, 0),
@@ -7429,7 +8219,7 @@ mod prop_tests {
                 assert!(!promo::img_refs(&gexing.raw_text).is_empty());
             } else {
                 // 20 条里 6 条真控件（2 bool + 1 combo + 2 color + 1 textinput）+ 4 个作者标题
-                // 多出来的那条是 `schemecolor`（本地化键 + color ⇒ 保留成色盘）
+                // ★ 2026-10-14：多出来的那条是 `schemecolor`（本地化键 + color ⇒ 保留成色盘）
                 assert_eq!(
                     (editable, heading, media, blank, loc),
                     (6, 4, 7, 3, 0),
@@ -7458,20 +8248,20 @@ mod prop_tests {
     }
 
     /// 真数据回归：**为什么 `nsfwversion`/`sfwversion`/`xrayversion`/`xrayglasses` 没做成单选组**。
-    /// 用户指出崩坏3 `2564205376` 的这四个 bool 「表现上像一组互斥选项」
+    ///
+    /// 用户（2026-10-13）指出崩坏3 `2564205376` 的这四个 bool 「表现上像一组互斥选项」
     /// （渲染器侧实测：`xrayversion=true` + `sfwversion=true` 与纯 SFW **逐像素 0 差异** ——
     /// 是 scene.json 里 SFW 层画在 X-Ray 层**之上**把它盖住了），要求**按数据**找分组信号、
     /// 找到才渲染 radio。这个测试把「找信号」这件事本身钉住，判据**只用真 `project.json` 的字段**：
-///
+    ///
     /// 1. 这 5 条属性（4 bool + 1 slider）的 `condition` **逐字节相同** = 字面量 `"true"`（恒显示）
-    /// ⇒ `condition` 既隔离不出那 4 个（把 slider 一起圈进来）、也没有互斥语义；
-///
+    ///    ⇒ `condition` 既隔离不出那 4 个（把 slider 一起圈进来）、也没有互斥语义；
     /// 2. `index` / `order` 是 0,1,2,3,4 / 100..104 的**逐条递增序号**（slider 夹在 0 与 2 之间）
-    /// ⇒ 不是「序号族」，切不出这四个；
-///
+    ///    ⇒ 不是「序号族」，切不出这四个；
     /// 3. 本机全部工坊工程的属性字段**全集**只有
-    /// {order,text,type,value,fraction,max,min,precision,step,condition,index,options}
-    /// **没有** group / radio / mutex / exclusive 之类组标记。
+    ///    {order,text,type,value,fraction,max,min,precision,step,condition,index,options}
+    ///    —— **没有** group / radio / mutex / exclusive 之类组标记。
+    ///
     /// ⇒ 找不到可靠信号 ⇒ **不做单选组、也不按属性名硬编码**（面板里仍是 4 个独立勾选框）。
     /// 反面也量了：把「condition 相同 ⇒ 一组」当规则用，会在 7 条工程上把 49 个互不相干的 bool
     /// 并成一组（`3299815325` 13 个、`2823687015` 9 个、`3571777169` 9 个、`2080534540` 6 个…）
@@ -7583,8 +8373,8 @@ mod prop_tests {
         assert_eq!(
             editable,
             vec![
-                // `schemecolor`（本地化键 + color）与 `xrayversion` 都是 `index 0`，
-                // 稳定排序下按文件里的顺序 ⇒ 它在最前。以前它被整行跳过，所以那时从 xrayversion 起。
+                // ★ 2026-10-14：`schemecolor`（本地化键 + color）与 `xrayversion` 都是 `index 0`，
+                //   稳定排序下按文件里的顺序 ⇒ 它在最前。以前它被整行跳过，所以那时从 xrayversion 起。
                 ("schemecolor", PropKind::Color),
                 ("xrayversion", PropKind::Bool),
                 ("xraysize", PropKind::Slider),
@@ -7610,6 +8400,7 @@ mod prop_tests {
     }
 
     // ── ③ 作者属性的「依赖显示」条件（`condition`）────────────────────────────
+    //
     // 判据全部来自数据：`<兄弟属性key>.value <op> <单个字面量>`；
     // 缺席 / 空串 / 解析不了 ⇒ **恒显示**（fail-open，理由见 `parse_condition` 上面那段注释）。
 
@@ -7739,7 +8530,7 @@ mod prop_tests {
     }
 
     /// 真数据回归：本机装的 `3704273480` / `2823687015`，逐条钉住「哪一行被条件挡住」。
-    /// 面板行数因此改变（`3704273480` 的 9 行 → 6 行；起多一条 `schemecolor`
+    /// 面板行数因此改变（`3704273480` 的 9 行 → 6 行；★ 2026-10-14 起多一条 `schemecolor`
     /// 色盘 ⇒ 10 → 7，**两边都 +1，差仍为 3**），所以这条测试也是那两次改动的回归网。
     #[test]
     fn real_projects_gate_rows_by_condition() {
@@ -7778,7 +8569,7 @@ mod prop_tests {
         let mut checked = 0;
 
         // ① 3704273480（麻匪 夏日影）：combo `newproperty` 默认值**字符串** "1"
-        // ⇒ `text` / `text5` / `newproperty1` 三行（`condition = newproperty.value == 2`）不显示
+        //    ⇒ `text` / `text5` / `newproperty1` 三行（`condition = newproperty.value == 2`）不显示
         if let Some(props) = props_of(&base, "3704273480") {
             let np = props.iter().find(|p| p.key == "newproperty").unwrap();
             assert_eq!(
