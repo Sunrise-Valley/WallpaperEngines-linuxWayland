@@ -41,16 +41,20 @@ fn main() -> cosmic::iced::Result {
     let flags = std::env::args().skip(1).collect::<Vec<_>>().join(" ");
 
     // Settings for configuring the application window and iced runtime.
-    // 默认给个像样的尺寸：WE 观感是「左侧网格 + 右侧常驻详情面板」，太窄会挤成一列。
+    // 默认尺寸 = app::WIN_DEFAULT（1488×900）：默认档（中 280）刚好一排 3 列、
+    // 右侧只留 16 px 余量（1400 只能排 2 列 + 一小列空白，见 app.rs 里那段推导）。
     let mut settings = cosmic::app::Settings::default()
-        .size(cosmic::iced::Size::new(1400.0, 900.0))
+        .size(cosmic::iced::Size::new(
+            app::WIN_DEFAULT.0,
+            app::WIN_DEFAULT.1,
+        ))
         .size_limits(
             cosmic::iced::Limits::NONE
                 .min_width(900.0)
                 .min_height(560.0),
         );
 
-    // win-w / --win-h <像素>：只给**截图**用 —— 把窗口放到想要的尺寸再截
+    // --win-w / --win-h <像素>：只给**截图**用 —— 把窗口放到想要的尺寸再截
     // （本机没有输入模拟工具，改不了窗口大小）。两个都省 = 用默认尺寸。
     let argv: Vec<String> = std::env::args().collect();
     let arg_of = |name: &str| -> Option<f32> {
@@ -62,8 +66,8 @@ fn main() -> cosmic::iced::Result {
     let win_w = arg_of("--win-w");
     let win_h = arg_of("--win-h");
     if win_w.is_some() || win_h.is_some() {
-        let w = win_w.unwrap_or(1400.0);
-        let h = win_h.unwrap_or(900.0);
+        let w = win_w.unwrap_or(app::WIN_DEFAULT.0);
+        let h = win_h.unwrap_or(app::WIN_DEFAULT.1);
         settings = settings.size(cosmic::iced::Size::new(w, h));
     }
 

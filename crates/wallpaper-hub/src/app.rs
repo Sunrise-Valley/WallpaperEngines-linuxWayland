@@ -947,8 +947,9 @@ impl cosmic::Application for AppModel {
                 .position(|a| *a == "--workshop-select")
                 .and_then(|i| args.get(i + 1))
                 .map(|s| s.to_string()),
-            win_w: 1280.0,
-            win_h: 900.0,
+            // 初值就按默认窗口尺寸：首帧（resize 事件到之前）也按 3 列算，避免先闪一帧 2 列
+            win_w: WIN_DEFAULT.0,
+            win_h: WIN_DEFAULT.1,
             cpu_sample: None,
             cpu_pct: None,
             selected: None,
@@ -3538,7 +3539,8 @@ impl AppModel {
                         .align_y(Alignment::Start),
                 );
             }
-            widget::scrollable(rows).height(Length::Fill).into()
+            // ★ 网格滚动条留沟槽（三页共用这一个口子，见 `grid_scrollable`）
+            grid_scrollable(rows)
         };
 
         widget::column::with_capacity(4)
@@ -3863,7 +3865,8 @@ impl AppModel {
                         .align_y(Alignment::Start),
                 );
             }
-            widget::scrollable(rows).height(Length::Fill).into()
+            // ★ 网格滚动条留沟槽（发现页 + 工坊页共用这一个口子，见 `grid_scrollable`）
+            grid_scrollable(rows)
         };
 
         let mut col = widget::column::with_capacity(5)
@@ -5942,6 +5945,20 @@ const FILTER_PANEL_KEY: &str = "panel";
 /// 右侧详情/属性面板的宽度（加宽到 540 —— 落在要求的 520~560 区间内）
 const PANEL_W: f32 = 540.0;
 
+/// **默认窗口尺寸**（逻辑像素）—— 一次性来源：`main.rs` 的开窗设置和 `AppModel.win_w`
+/// 的初值都取这里，别再各写一份（以前 main 写 1400×900、app 里初值写 1280，两处口径不同）。
+///
+/// 取值依据（2026-10-23 实测「界面横向比例」）：
+/// * 默认档（中 = 280×158）一排要 **3 列** ⇒ 需要的窗口宽
+///   `CHROME_X(24) + GRID_SCROLL_RESERVE(20) + PANEL_W(540) + 3×280 + 2×TILE_GAP(24) = 1472`。
+/// * 1472 时右侧余量正好 **0**（实测：最后一张卡右边 ↔ 面板左边只剩滚动条沟槽），
+///   所以取 **1472 + 16 = 1488** ⇒ 右侧固定 16 px 余量，既不出现“半列空白”，
+///   也不会让第 4 列勉强挤进来。
+/// * 旧默认 1400 只能放 2 列、右边空 232 px（≈0.83 张卡）= 用户说的“两列 + 一小列空白”。
+///   实测与逐宽度扫描见 `artifacts/ui6-colwidth-20261023/`、`scripts/u6_width_scan.py`。
+/// * 高度仍取 900（按 16:9 该是 837；900 一屏能露出 3 排整卡 + 第 4 排开头，密度更接近 WE）。
+pub const WIN_DEFAULT: (f32, f32) = (1488.0, 900.0);
+
 /// 详情面板顶部大预览图的**显示上限**（宽 / 高，逻辑像素）。
 ///
 /// 用户反馈：「把右侧的缩览图缩小一些吧，不要搞这么大。图像都缩放模糊了，观感不好」——
@@ -6019,20 +6036,56 @@ const COLOR_PRESETS: [&str; 12] = [
     "1 0 1",
 ];
 
+/// 网格右侧给竖直滚动条留的**沟槽**（卡片右边缘 ↔ 滚动条之间的空白，像素）。
+///
+/// 用户 2026-10-23：「我说的是滚动条，使用鼠标滚轮上下翻动壁纸时的滚动条」——
+/// 卡片和滚动条贴在一起，要留出缝。12 px 比视觉最小要求（10）多 2 px 余量。
+const GRID_SCROLL_GUTTER: f32 = 12.0;
+
+/// 网格滚动条**自己在横向占掉的宽度** = 滚动条宽 8 + 沟槽 12。
+/// 列数（`tiles_per_row`）和「至少两列」的判据都必须把它扣掉，否则最右一张卡片
+/// 会被裁掉 20 px（滚动区是纵向的，横向没有滚动条可救）。
+const GRID_SCROLL_RESERVE: f32 = 8.0 + GRID_SCROLL_GUTTER;
+
+/// 壁纸网格的滚动容器 —— **三个页共用这一个口子**（已安装页 + 发现/工坊共用的
+/// `view_browse`），改这里就三页同时生效，别再各写一份。
+///
+/// ★ 为什么要显式给 `Scrollbar`：cosmic 的 `widget::scrollable` 默认是
+/// `Scrollbar::new()`，它的 `spacing` 是 `None` ⇒ iced 的 `Scrollable::layout()`
+/// 只在 `spacing` 有值时才给内容留右侧 padding（`padding = width + margin*2 + spacing`），
+/// 否则内容右边缘 = 滚动区右边界 ⇒ 卡片身上压着滚动条（用户说的「贴在一起」）。
+/// 这里把 `spacing` 设成沟槽宽 ⇒ 滚动条可见（宽 8，不是 0）且卡片让开 12 px。
+fn grid_scrollable<'a>(content: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
+    widget::scrollable(content)
+        .direction(cosmic::iced::widget::scrollable::Direction::Vertical(
+            cosmic::iced::widget::scrollable::Scrollbar::new()
+                .width(8.0)
+                .scroller_width(8.0)
+                .spacing(GRID_SCROLL_GUTTER),
+        ))
+        // 与 cosmic 默认那一层一致：滚动条上下端各留 8（纯视觉，不影响布局）
+        .padding(8.0)
+        .height(Length::Fill)
+        .into()
+}
+
 /// 右侧面板宽度：目标 `PANEL_W`（540，落在要求的 520~560 区间）。
 ///
 /// 窗口很窄时**退让**（否则中间网格会被压成一列甚至压没）：保证左边至少还能放两列格子，
 /// 但不会小于 320（再小属性行的控件列就摆不下了）。900 宽（本程序的最小宽度）时 =
 /// 900 - 24 - (2×168+8) = 532，仍在 520~560 内。
+///
+/// 2026-10-23 起「至少两列」里还算上滚动条沟槽（[`GRID_SCROLL_RESERVE`]）——
+/// 网格要给滚动条让路，否则这个下界就不再等于"两列放得下"。
 fn panel_width(win_w: f32, card_w: f32) -> f32 {
-    let left_min = card_w * 2.0 + TILE_GAP;
+    let left_min = card_w * 2.0 + TILE_GAP + GRID_SCROLL_RESERVE;
     (win_w - CHROME_X - left_min).clamp(320.0, PANEL_W)
 }
 
-/// 缩略图**每行放几个**：按窗口逻辑宽度算（右侧面板 + 左右留白先扣掉）。
+/// 缩略图**每行放几个**：按窗口逻辑宽度算（右侧面板 + 左右留白 + 滚动条沟槽先扣掉）。
 /// 抽成纯函数是为了能单测 —— "窗口变窄 ⇒ 每行少放几个"必须可验证，别靠截图猜。
 fn tiles_per_row(win_w: f32, card_w: f32) -> usize {
-    let avail = (win_w - panel_width(win_w, card_w) - CHROME_X).max(card_w);
+    let avail = (win_w - panel_width(win_w, card_w) - CHROME_X - GRID_SCROLL_RESERVE).max(card_w);
     (((avail + TILE_GAP) / (card_w + TILE_GAP)).floor() as usize).clamp(1, 12)
 }
 
@@ -7765,15 +7818,15 @@ mod layout_tests {
             // 极窄也不小于 320（再小控件列摆不下）
             assert_eq!(panel_width(600.0, w), 320.0);
         }
-        // 1280（默认窗口）：小/中仍是 540，大档退让到 512（= 1280 - 24 - (2×360+24)）
+        // 1280（旧默认窗口；保留作窄窗口样本）：小/中仍是 540，大档退让到 492（= 1280 - 24 - (2×360+24+20 滚动条沟槽)）
         assert_eq!(panel_width(1280.0, CARD_SIZES[0].0), 540.0);
         assert_eq!(panel_width(1280.0, CARD_SIZES[1].0), 540.0);
-        assert_eq!(panel_width(1280.0, CARD_SIZES[2].0), 512.0);
+        assert_eq!(panel_width(1280.0, CARD_SIZES[2].0), 492.0);
         // 默认档（中 = 280×158）：最小窗口 900 时退让到 320（左边只够一列 280）
         let mid = CARD_SIZES[CARD_DEFAULT].0;
         assert_eq!(panel_width(900.0, mid), 320.0);
-        // 小档（220）在 900 宽窗口里退让到 412 —— 900 - 24 - (2×220+24)
-        assert_eq!(panel_width(900.0, CARD_SIZES[0].0), 412.0);
+        // 小档（220）在 900 宽窗口里退让到 392 —— 900 - 24 - (2×220+24+20)
+        assert_eq!(panel_width(900.0, CARD_SIZES[0].0), 392.0);
     }
 
     /// 防抖：**连点 5 次只放行 1 次** —— 用的是 app 里**真正在跑**的那个状态机
@@ -7816,13 +7869,17 @@ mod layout_tests {
     fn tiles_per_row_follows_window_and_card_width() {
         let (small, mid, large) = (CARD_SIZES[0].0, CARD_SIZES[1].0, CARD_SIZES[2].0);
 
-        // 1280 宽（默认窗口）：小 3 列 / 中 2 列 / 大 2 列（大档会把面板压到 512 才保住 2 列）
-        assert_eq!(tiles_per_row(1280.0, small), 3);
+        // 1280 宽（旧默认窗口）：三档都是 2 列 —— 小档的第三列本来只剩 8 px 余量，
+        // 滚动条沟槽（20 px）要占到它 ⇒ 让位给列数，别把最右一张卡片裁掉。
+        assert_eq!(tiles_per_row(1280.0, small), 2);
         assert_eq!(tiles_per_row(1280.0, mid), 2);
         assert_eq!(tiles_per_row(1280.0, large), 2);
 
-        // 1400 宽（验收基准）：默认档中 = 2 列；1900 宽 ⇒ 4 列（列数确实跟着窗口变）
+        // 1400（更早的默认窗口，2 列 + 232 px 空白 = 用户说的"两列 + 一小列"）：小 3 / 中 2
+        // 1488（现默认，见 WIN_DEFAULT）：中档 3 列；1900 宽 ⇒ 4 列（列数确实跟着窗口变）
+        assert_eq!(tiles_per_row(1400.0, small), 3);
         assert_eq!(tiles_per_row(1400.0, mid), 2);
+        assert_eq!(tiles_per_row(1400.0, large), 2);
         assert_eq!(tiles_per_row(1900.0, mid), 4);
         assert_eq!(tiles_per_row(1920.0, mid), 4);
         assert_eq!(tiles_per_row(1000.0, mid), 2);
@@ -7848,6 +7905,94 @@ mod layout_tests {
             assert!(n >= prev, "窗口变宽列数不该减少（{w}）");
             prev = n;
         }
+    }
+
+    /// 网格滚动条的**沟槽**（用户 2026-10-23）：≥10 px，且列数永远算上滚动条那 20 px ——
+    /// 滚动区是纵向的，最右一张卡片一旦超出就**没有横向滚动条可救**，会被直接裁掉。
+    #[test]
+    fn grid_scroll_gutter_is_at_least_10px_and_never_clips_the_last_card() {
+        assert!(
+            GRID_SCROLL_GUTTER >= 10.0,
+            "卡片 ↔ 滚动条的沟槽只有 {} px（要求 ≥10）",
+            GRID_SCROLL_GUTTER
+        );
+        assert_eq!(GRID_SCROLL_RESERVE, 8.0 + GRID_SCROLL_GUTTER, "滚动条宽 8");
+
+        for (cw, _) in CARD_SIZES {
+            for w in (900..2600).step_by(7) {
+                let (w, cw) = (w as f32, cw);
+                let n = tiles_per_row(w, cw) as f32;
+                let avail =
+                    (w - panel_width(w, cw) - CHROME_X - GRID_SCROLL_RESERVE).max(cw);
+                let used = n * cw + (n - 1.0) * TILE_GAP;
+                assert!(
+                    used <= avail + 0.5,
+                    "{w}×{cw}: {n} 列要 {used} px，可用只有 {avail} px ⇒ 最右一张会被裁"
+                );
+            }
+        }
+    }
+
+    /// **默认窗口 = 一排 3 列（默认档 280）且右侧不出现“半列空白”** —— 用户 2026-10-23：
+    /// 「把默认窗口改为…可以默认展示三列缩略图，而不是两列 + 一小列空白」。
+    ///
+    /// 四条判据（都走 `tiles_per_row` 同一口径，不靠目测）：
+    /// 1. 默认宽度下默认档 = 3 列；
+    /// 2. 右侧空白 = **8..=16 px**（不是「半列」那种 >100，也不是 0 = 卡片贴面板）；
+    /// 3. 再窄 17 px 就掉回 2 列 ⇒ 默认宽度确实是「刚好吃下 3 列」的最小值 + 余量；
+    /// 4. 这个宽度下细节面板仍是满宽 540（不靠压缩面板凑列数）。
+    #[test]
+    fn default_window_fits_three_default_tier_columns_with_a_16px_margin() {
+        let (w, h) = WIN_DEFAULT;
+        let mid = CARD_SIZES[CARD_DEFAULT].0;
+        // 旧默认 1400 的病灶：2 列 + 232 px 空白（= 用户说的「两列 + 一小列」）
+        assert_eq!(tiles_per_row(1400.0, mid), 2, "1400 仍应只有 2 列（旧默认的病灶）");
+
+        assert_eq!(tiles_per_row(w, mid), 3, "默认宽度 {w} 下默认档必须 3 列");
+        let avail = (w - panel_width(w, mid) - CHROME_X - GRID_SCROLL_RESERVE).max(mid);
+        let leftover = avail - (3.0 * mid + 2.0 * TILE_GAP);
+        assert!(
+            (8.0..=16.0).contains(&leftover),
+            "右侧余量 {leftover} px 不在 8~16（0 = 贴面板，>100 = 又出现半列空白）"
+        );
+        assert_eq!(panel_width(w, mid), PANEL_W, "默认宽度下面板不该被压缩");
+        assert_eq!(
+            tiles_per_row(w - 17.0, mid),
+            2,
+            "{w} 就是「刚好吃下 3 列」的那个宽度（再窄 17 就 2 列）"
+        );
+
+        // 同一宽度下另外两档的列数（报数用；改档位/间隙时这条会提醒重新量）
+        assert_eq!(tiles_per_row(w, CARD_SIZES[0].0), 3, "小档 220 = 3 列");
+        assert_eq!(tiles_per_row(w, CARD_SIZES[2].0), 2, "大档 360 = 2 列");
+        assert!(h >= 800.0, "高度 {h} 至少能露 3 排 158 高的卡片");
+    }
+
+    /// 宽度扫描表（`cargo test --release -- --nocapture` 可看）：每档列数 + 右侧剩余空白。
+    /// 与 `scripts/u6_width_scan.py --scan` 同一口径，改动布局常量时两边一起看。
+    #[test]
+    fn width_scan_table_matches_the_python_scan() {
+        eprintln!("win_w | 小220 列/余 | 中280 列/余 | 大360 列/余");
+        for w in (1000..=1600).step_by(50) {
+            let w = w as f32;
+            let cell = |cw: f32| {
+                let a = (w - panel_width(w, cw) - CHROME_X - GRID_SCROLL_RESERVE).max(cw);
+                let n = tiles_per_row(w, cw);
+                (n, a - (n as f32 * cw + (n as f32 - 1.0) * TILE_GAP))
+            };
+            let (s, m, l) = (
+                cell(CARD_SIZES[0].0),
+                cell(CARD_SIZES[1].0),
+                cell(CARD_SIZES[2].0),
+            );
+            eprintln!(
+                "{w:>5} | {:>2} 列/{:>4.0} | {:>2} 列/{:>4.0} | {:>2} 列/{:>4.0}",
+                s.0, s.1, m.0, m.1, l.0, l.1
+            );
+        }
+        // 表格的两个锚点（与 artifacts/ui6-colwidth-20261023 的截图一致）
+        assert_eq!(tiles_per_row(1400.0, CARD_SIZES[1].0), 2);
+        assert_eq!(tiles_per_row(1488.0, CARD_SIZES[1].0), 3);
     }
 
     /// 卡片默认档 = 中（**280×158**）：用户 2026-10-21 第二轮「当前的大（280×158）当标准」。
