@@ -1,6 +1,6 @@
 [package]
 name = "wallpaper-hub"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "MIT"
 description = "COSMIC desktop front-end for the native Wallpaper Engine scene kernel"

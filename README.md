@@ -16,7 +16,7 @@ GL/EGL 渲染器把画面画到 `wlr-layer-shell` 背景层上，并提供一个
 **引擎不依赖 Steam 客户端。** 它不登录、不订阅、不下载，甚至完全不需要装 Steam。它只读
 磁盘上普通的目录里的场景壁纸 —— 见[壁纸从哪来](#壁纸从哪来)。
 
-**版本：** 0.1.0 · **Changelog：** [CHANGELOG.md](CHANGELOG.md) —— 改了什么，以及预编译
+**版本：** 0.2.0 · **Changelog：** [CHANGELOG.md](CHANGELOG.md) —— 改了什么，以及预编译
 包的 `libc6` 注意事项。
 
 ---
@@ -216,7 +216,7 @@ crates/wallpaper-hub/target/release/wallpaper-hub
 > git clone https://github.com/Sunrise-Valley/WallpaperEngines-linuxWayland
 > cd WallpaperEngines-linuxWayland
 > packaging/build-deb.sh          # 需要 Rust 工具链 + docs/BUILDING.md 里的开发头文件
-> sudo apt install ./dist/wallpaper-hub_0.1.0_amd64.deb
+> sudo apt install ./dist/wallpaper-hub_0.2.0_amd64.deb
 > ```
 >
 > 用 `ldd --version | head -1` 看你自己的 `libc6`；低于 2.43 的话，预编译文件不是给你的。
@@ -225,7 +225,7 @@ crates/wallpaper-hub/target/release/wallpaper-hub
 
 ```sh
 # 1. 拿到包（release 附件，或自己构建：见下）
-sudo apt install ./dist/wallpaper-hub_0.1.0_amd64.deb   # 文件在本仓库 dist/ 里
+sudo apt install ./dist/wallpaper-hub_0.2.0_amd64.deb   # 文件在本仓库 dist/ 里
 
 # 2. 给当前用户启动；unit 都是 user unit，不需要 root
 systemctl --user daemon-reload
@@ -347,4 +347,4 @@ sudo apt remove wallpaper-hub
 
 ---
 
-英文版：[**README.en.md（English）**](README.en.md) · 版本 0.1.0 · [CHANGELOG.md](CHANGELOG.md)
+英文版：[**README.en.md（English）**](README.en.md) · 版本 0.2.0 · [CHANGELOG.md](CHANGELOG.md)

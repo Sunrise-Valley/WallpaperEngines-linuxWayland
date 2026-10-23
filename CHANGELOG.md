@@ -4,6 +4,62 @@
 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循
 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.2.0] - 2026-10-23
+
+界面与筛选向 Wallpaper Engine 对齐的一版：工坊筛选按逆向出的真实语义重写，三页的密度、
+翻页与筛选面板布局重做。
+
+### Changed
+
+**筛选系统（工坊页）：按 WE 真实语义重写**
+
+* **`excludedtags[]` 黑名单语义**：勾选 = **不排除**，只有未勾的项才进 `excludedtags[]`。
+  组内 OR、组间 AND 全部由这一侧表达 —— 一页只发**一条**请求，不再按标签组合叉乘。
+* **筛选组照抄 WE 词表**：类型（场景 / 视频 / 网页 / 应用程序 ＋ 壁纸 / 预设）、
+  年龄分级（大众级 G / 家长指导 PG-13 / 成人 R-18）、分辨率（宽屏、超宽屏、双显示器、
+  三显示器、纵向监视器/手机，每个宽高比子组带「所有 / 无」，另有「其他分辨率」
+  「动态分辨率」）、标签（25 个真实风格标签，`Unspecified` 排在末尾，与 WE 一致）。
+* **「仅显示」组**（WE 里唯一不可折叠的组）：广受好评 → `requiredtags[]=Approved`；
+  移动端兼容 → 额外排除 Application / Web。
+* **默认值 = WE 默认**：Application 不勾（WE 工坊浏览页同样不显示它）、PG-13 与 R-18 不勾、
+  分辨率与标签全勾 ⇒ 默认查询只带 `excludedtags[]`，不带 `requiredtags[]`、不带 `searchtext`。
+* **「重置过滤器」= 回到默认值**（再套 `defaultfilterconfig`），不是「清空筛选」。
+* **分组数 5 → 4**：删掉「来源」组（Official / Workshop / Local）。引擎已不与 Steam 通信，
+  来源不再是有效筛选维度；配置里残留的 `source:*` 行会按未知组丢弃。
+* 筛选有单测钉住：从规格表**独立推导**「这些项没勾」时应有的 `excludedtags` 集合，
+  再与生成的 URL 逐项比对（不靠肉眼对参数名）。
+
+**界面**
+
+一轮以「密度与可读性」为目标的界面整理（全部有布局单测钉住，不靠截图猜）：
+
+* **筛选面板默认展开**，并记住手动折叠状态（`Group::expanded` 持久化到 `Config::workshop_fold`）。
+  面板高度上限 28% 窗口高，超出部分在面板内部滚动，不再把详情区挤没。
+* **发现页改为「热度推荐」**：不再复用筛选面板，直接走 `browsesort=trend` 的热门排序
+  （`BrowseSurface::{Hot, Workshop}`），只带搜索词、不带筛选组；工坊页仍走完整筛选。
+* **三页各自的底部翻页行**（`view_page_bar`）：首页 / 上一页 / 7 个页码 / 下一页 / 尾页，
+  页码跟着当前页居中滚动，翻页不再需要回到顶部。
+* **预览图与控件间距 16 px**：右侧面板的缩略预览和下面的属性控件分开，视觉上不再黏成一块。
+* **网格滚动条留 12 px 沟槽**（`grid_scrollable` + `GRID_SCROLL_GUTTER`/`GRID_SCROLL_RESERVE`）：
+  卡片右边缘不再压着滚动条；列数计算同时扣掉「滚动条 8 + 沟槽 12」，
+  最右一张卡片不会被裁（滚动区是纵向的，横向没有滚动条可救）。
+* **默认窗口 1488×900**（`WIN_DEFAULT`，开窗设置与 `AppModel` 初值共用一处）：
+  默认档（280×158）一排 **3 列**、右侧固定 16 px 余量。旧默认 1400 只能排 2 列、
+  右边空 ≈232 px（即用户说的「两列 + 一小列空白」）。
+
+### English summary
+
+Filters now mirror Wallpaper Engine's real semantics: a checkbox means *not excluded*, so only
+unchecked items go into `excludedtags[]` (OR inside a group, AND across groups — one request per
+page instead of a cross product); four groups copying WE's vocabulary (type, rating, resolution
+with per-aspect "all/none", 25 style tags), an always-open "show only" group
+(`requiredtags[]=Approved`, mobile-compatible → exclude Application/Web), WE's defaults
+(Application, PG-13 and R-18 unchecked), and "reset" restoring those defaults rather than
+clearing. The library/workshop UI got a density pass: filters open by default with persisted
+collapse state, Discover becomes a `browsesort=trend` hot list, a bottom page bar on every page,
+16 px between preview and controls, a 12 px grid scroll gutter, and a 1488×900 default window
+(3 columns at the default card size).
+
 ## [0.1.0] - 2026-10-22
 
 首个公开发布版本。First public release.
@@ -69,25 +125,6 @@
 * `wallpaper-hub.service` 改为 `Restart=on-failure` + `SuccessExitStatus=0`：关窗口
   是正常退出，不拉起；崩溃才重启。
 
-### UI
-
-一轮以「密度与可读性」为目标的界面整理（全部有布局单测钉住，不靠截图猜）：
-
-* **筛选面板默认展开**，并记住手动折叠状态（`Group::expanded` 持久化到 `Config::workshop_fold`）。
-  面板高度上限 28% 窗口高，超出部分在面板内部滚动，不再把详情区挤没。
-* **发现页改为「热度推荐」**：不再复用筛选面板，直接走 `browsesort=trend` 的热门排序
-  （`BrowseSurface::{Hot, Workshop}`），只带搜索词、不带筛选组；工坊页仍走完整筛选。
-* **工坊页去掉「来源」分组**：组数 5 → 4 —— 引擎已不与 Steam 通信，来源不再是有效筛选维度。
-* **三页各自的底部翻页行**（`view_page_bar`）：首页 / 上一页 / 7 个页码 / 下一页 / 尾页，
-  页码跟着当前页居中滚动，翻页不再需要回到顶部。
-* **预览图与控件间距 16 px**：右侧面板的缩略预览和下面的属性控件分开，视觉上不再黏成一块。
-* **网格滚动条留 12 px 沟槽**（`grid_scrollable` + `GRID_SCROLL_GUTTER`/`GRID_SCROLL_RESERVE`）：
-  卡片右边缘不再压着滚动条；列数计算同时扣掉「滚动条 8 + 沟槽 12」，
-  最右一张卡片不会被裁（滚动区是纵向的，横向没有滚动条可救）。
-* **默认窗口 1488×900**（`WIN_DEFAULT`，开窗设置与 `AppModel` 初值共用一处）：
-  默认档（280×158）一排 **3 列**、右侧固定 16 px 余量。旧默认 1400 只能排 2 列、
-  右边空 ≈232 px（即用户说的「两列 + 一小列空白」）。
-
 ### Fixed
 
 * 属性绑定：`{"user": …}` 形式的属性引用现在正确解析（此前整条属性静默失效）。
@@ -127,4 +164,5 @@ double-present in the offline renderer, window-close respawn, and — most visib
 the wallpaper volume slider no longer moves the system volume (per-stream gain).
 Note: the prebuilt `.deb` requires `libc6 >= 2.43` (built on Debian forky).
 
+[0.2.0]: https://github.com/Sunrise-Valley/WallpaperEngines-linuxWayland/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/Sunrise-Valley/WallpaperEngines-linuxWayland/releases/tag/v0.1.0

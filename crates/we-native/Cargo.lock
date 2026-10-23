@@ -1612,7 +1612,7 @@ dependencies = [
 
 [[package]]
 name = "we-native"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "image",
  "libc",
@@ -1627,7 +1627,7 @@ dependencies = [
 
 [[package]]
 name = "we-scene"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -1635,7 +1635,7 @@ dependencies = [
 
 [[package]]
 name = "we-scene-render"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ab_glyph",
  "boa_engine",

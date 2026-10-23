@@ -19,7 +19,7 @@ subscribe, does not download anything, and does not need Steam installed at all.
 scene wallpapers from plain directories on your disk — see
 [Where wallpapers come from](#where-wallpapers-come-from).
 
-**Version:** 0.1.0 · **Changelog:** [CHANGELOG.md](CHANGELOG.md) — what changed, and the
+**Version:** 0.2.0 · **Changelog:** [CHANGELOG.md](CHANGELOG.md) — what changed, and the
 `libc6` caveat for the prebuilt package.
 
 ---
@@ -236,7 +236,7 @@ crates/wallpaper-hub/target/release/wallpaper-hub
 > git clone https://github.com/Sunrise-Valley/WallpaperEngines-linuxWayland
 > cd WallpaperEngines-linuxWayland
 > packaging/build-deb.sh          # needs a Rust toolchain + the dev headers in docs/BUILDING.md
-> sudo apt install ./dist/wallpaper-hub_0.1.0_amd64.deb
+> sudo apt install ./dist/wallpaper-hub_0.2.0_amd64.deb
 > ```
 >
 > Read `libc6` of your own system with `ldd --version | head -1`; if it is below 2.43 the
@@ -247,7 +247,7 @@ install it.
 
 ```sh
 # 1. get the package (release asset, or build it yourself: see below)
-sudo apt install ./dist/wallpaper-hub_0.1.0_amd64.deb   # file lives in dist/ in this repo
+sudo apt install ./dist/wallpaper-hub_0.2.0_amd64.deb   # file lives in dist/ in this repo
 
 # 2. start it for the current user; the units are user units, no root involved
 systemctl --user daemon-reload
